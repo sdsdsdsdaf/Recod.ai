@@ -1,0 +1,13 @@
+# Model checkpoints and data
+*.pth
+*.h5
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+/**/*.pth
+/**/*.h5
