@@ -1,9 +1,19 @@
 
+# %%
+# IMPORTANT: RUN THIS CELL IN ORDER TO IMPORT YOUR KAGGLE DATA SOURCES,
+# THEN FEEL FREE TO DELETE THIS CELL.
+# NOTE: THIS NOTEBOOK ENVIRONMENT DIFFERS FROM KAGGLE'S PYTHON
+# ENVIRONMENT SO THERE MAY BE MISSING LIBRARIES USED BY YOUR
+# NOTEBOOK.
 
 recodai_luc_scientific_image_forgery_detection_path = r'C:\Users\user\.cache\kagglehub\competitions\recodai-luc-scientific-image-forgery-detection'
+aikim12345689_smp_unet_pytorch_smp2_4_path =r'C:\Users\user\.cache\kagglehub\models\aikim12345689\smp-unet\PyTorch\smp2\4'
 
 print('Data source import complete.')
 
+
+# %%
+r'C:\Users\user\.cache\kagglehub\competitions\recodai-luc-scientific-image-forgery-detection'
 
 # %%
 print(recodai_luc_scientific_image_forgery_detection_path)
@@ -12,6 +22,10 @@ print(recodai_luc_scientific_image_forgery_detection_path)
 # # **Init setting**
 
 # %%
+
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import os
 import cv2
 import json
@@ -64,28 +78,14 @@ DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
 # %%
 import json
-import cv2
+
 import numba
-import numpy.typing as npt
+import numpy as np
 from numba import types
+import numpy.typing as npt
+import pandas as pd
 import scipy.optimize
 
-@numba.jit(nopython=True)
-def _rle_encode_jit(x: npt.NDArray, fg_val:int=1) -> list[int]:
-    """Numba-jitted RLE encoder."""
-    dots = np.where(x.ravel(order='F') == fg_val)[0]
-    run_lengths = []
-    prev = -2
-    for b in dots:
-        if b > prev + 1: # Is not continous 1
-            run_lengths.extend((b+1, 0))
-        run_lengths[-1] += 1
-        prev = b
-
-    return run_lengths
-
-def rle_encode(masks: list[npt.NDArray], fg_val:int=1) -> str:
-    import json
 
 class ParticipantVisibleError(Exception):
     pass
@@ -112,51 +112,177 @@ def rle_encode(masks: list[npt.NDArray], fg_val: int = 1) -> str:
         masks: list of numpy array of shape (height, width), 1 - mask, 0 - background
     Returns: run length encodings as a string, with each RLE JSON-encoded and separated by a semicolon.
     """
-
     return ';'.join([json.dumps(_rle_encode_jit(x, fg_val)) for x in masks])
 
+
 @numba.njit
-def _rle_decode_jit(mask_rle:npt.NDArray, height:int, width:int) -> npt.NDArray:
+def _rle_decode_jit(mask_rle: npt.NDArray, height: int, width: int) -> npt.NDArray:
     """
     s: numpy array of run-length encoding pairs (start, length)
     shape: (height, width) of array to return
     Returns numpy array, 1 - mask, 0 - background
     """
-
-    if not len(mask_rle) % 2 == 0:
+    if len(mask_rle) % 2 != 0:
+        # Numba requires raising a standard exception.
         raise ValueError('One or more rows has an odd number of values.')
 
     starts, lengths = mask_rle[0::2], mask_rle[1::2]
     starts -= 1
     ends = starts + lengths
-
     for i in range(len(starts) - 1):
         if ends[i] > starts[i + 1]:
             raise ValueError('Pixels must not be overlapping.')
     img = np.zeros(height * width, dtype=np.bool_)
     for lo, hi in zip(starts, ends):
         img[lo:hi] = 1
-
     return img
 
-def rle_decode(mask_rle:str, shape:tuple[int, int],) -> npt.NDArray:
+
+def rle_decode(mask_rle: str, shape: tuple[int, int]) -> npt.NDArray:
     """
     mask_rle: run-length as string formatted (start length)
               empty predictions need to be encoded with '-'
     shape: (height, width) of array to return
     Returns numpy array, 1 - mask, 0 - background
     """
+
     mask_rle = json.loads(mask_rle)
     mask_rle = np.asarray(mask_rle, dtype=np.int32)
     starts = mask_rle[0::2]
-
-    if not sorted(starts) == list(starts):
+    if sorted(starts) != list(starts):
         raise ParticipantVisibleError('Submitted values must be in ascending order.')
-
     try:
         return _rle_decode_jit(mask_rle, shape[0], shape[1]).reshape(shape, order='F')
     except ValueError as e:
         raise ParticipantVisibleError(str(e)) from e
+
+
+def calculate_f1_score(pred_mask: npt.NDArray, gt_mask: npt.NDArray):
+    pred_flat = pred_mask.flatten()
+    gt_flat = gt_mask.flatten()
+
+    tp = np.sum((pred_flat == 1) & (gt_flat == 1))
+    fp = np.sum((pred_flat == 1) & (gt_flat == 0))
+    fn = np.sum((pred_flat == 0) & (gt_flat == 1))
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+
+    if (precision + recall) > 0:
+        return 2 * (precision * recall) / (precision + recall)
+    else:
+        return 0
+
+
+def calculate_f1_matrix(pred_masks: list[npt.NDArray], gt_masks: list[npt.NDArray]):
+    """
+    Parameters:
+    pred_masks (np.ndarray):
+            First dimension is the number of predicted instances.
+            Each instance is a binary mask of shape (height, width).
+    gt_masks (np.ndarray):
+            First dimension is the number of ground truth instances.
+            Each instance is a binary mask of shape (height, width).
+    """
+
+    num_instances_pred = len(pred_masks)
+    num_instances_gt = len(gt_masks)
+    f1_matrix = np.zeros((num_instances_pred, num_instances_gt))
+
+    # Calculate F1 scores for each pair of predicted and ground truth masks
+    for i in range(num_instances_pred):
+        for j in range(num_instances_gt):
+            pred_flat = pred_masks[i].flatten()
+            gt_flat = gt_masks[j].flatten()
+            f1_matrix[i, j] = calculate_f1_score(pred_mask=pred_flat, gt_mask=gt_flat)
+
+    if f1_matrix.shape[0] < len(gt_masks):
+        # Add a row of zeros to the matrix if the number of predicted instances is less than ground truth instances
+        f1_matrix = np.vstack((f1_matrix, np.zeros((len(gt_masks) - len(f1_matrix), num_instances_gt))))
+
+    return f1_matrix
+
+
+def oF1_score(pred_masks: list[npt.NDArray], gt_masks: list[npt.NDArray]):
+    """
+    Calculate the optimal F1 score for a set of predicted masks against
+    ground truth masks which considers the optimal F1 score matching.
+    This function uses the Hungarian algorithm to find the optimal assignment
+    of predicted masks to ground truth masks based on the F1 score matrix.
+    If the number of predicted masks is less than the number of ground truth masks,
+    it will add a row of zeros to the F1 score matrix to ensure that the dimensions match.
+
+    Parameters:
+    pred_masks (list of np.ndarray): List of predicted binary masks.
+    gt_masks (np.ndarray): Array of ground truth binary masks.
+    Returns:
+    float: Optimal F1 score.
+    """
+    f1_matrix = calculate_f1_matrix(pred_masks, gt_masks)
+
+    # Find the best matching between predicted and ground truth masks
+    row_ind, col_ind = scipy.optimize.linear_sum_assignment(-f1_matrix)
+    # The linear_sum_assignment discards excess predictions so we need a separate penalty.
+    excess_predictions_penalty = len(gt_masks) / max(len(pred_masks), len(gt_masks))
+    return np.mean(f1_matrix[row_ind, col_ind]) * excess_predictions_penalty
+
+
+def evaluate_single_image(label_rles: str, prediction_rles: str, shape_str: str) -> float:
+    shape = json.loads(shape_str)
+    label_rles = [rle_decode(x, shape=shape) for x in label_rles.split(';')]
+    prediction_rles = [rle_decode(x, shape=shape) for x in prediction_rles.split(';')]
+    return oF1_score(prediction_rles, label_rles)
+
+
+def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: str) -> float:
+    """
+    Args:
+        solution (pd.DataFrame): The ground truth DataFrame.
+        submission (pd.DataFrame): The submission DataFrame.
+        row_id_column_name (str): The name of the column containing row IDs.
+    Returns:
+        float
+
+    Examples
+    --------
+    >>> solution = pd.DataFrame({'row_id': [0, 1, 2], 'annotation': ['authentic', 'authentic', 'authentic'], 'shape': ['authentic', 'authentic', 'authentic']})
+    >>> submission = pd.DataFrame({'row_id': [0, 1, 2], 'annotation': ['authentic', 'authentic', 'authentic']})
+    >>> score(solution.copy(), submission.copy(), row_id_column_name='row_id')
+    1.0
+
+    >>> solution = pd.DataFrame({'row_id': [0, 1, 2], 'annotation': ['authentic', 'authentic', 'authentic'], 'shape': ['authentic', 'authentic', 'authentic']})
+    >>> submission = pd.DataFrame({'row_id': [0, 1, 2], 'annotation': ['[101, 102]', '[101, 102]', '[101, 102]']})
+    >>> score(solution.copy(), submission.copy(), row_id_column_name='row_id')
+    0.0
+
+    >>> solution = pd.DataFrame({'row_id': [0, 1, 2], 'annotation': ['[101, 102]', '[101, 102]', '[101, 102]'], 'shape': ['[720, 960]', '[720, 960]', '[720, 960]']})
+    >>> submission = pd.DataFrame({'row_id': [0, 1, 2], 'annotation': ['[101, 102]', '[101, 102]', '[101, 102]']})
+    >>> score(solution.copy(), submission.copy(), row_id_column_name='row_id')
+    1.0
+
+    >>> solution = pd.DataFrame({'row_id': [0, 1, 2], 'annotation': ['[101, 103]', '[101, 102]', '[101, 102]'], 'shape': ['[720, 960]', '[720, 960]', '[720, 960]']})
+    >>> submission = pd.DataFrame({'row_id': [0, 1, 2], 'annotation': ['[101, 102]', '[101, 102]', '[101, 102]']})
+    >>> score(solution.copy(), submission.copy(), row_id_column_name='row_id')
+    0.9983739837398374
+
+    >>> solution = pd.DataFrame({'row_id': [0, 1, 2], 'annotation': ['[101, 102];[300, 100]', '[101, 102]', '[101, 102]'], 'shape': ['[720, 960]', '[720, 960]', '[720, 960]']})
+    >>> submission = pd.DataFrame({'row_id': [0, 1, 2], 'annotation': ['[101, 102]', '[101, 102]', '[101, 102]']})
+    >>> score(solution.copy(), submission.copy(), row_id_column_name='row_id')
+    0.8333333333333334
+    """
+    df = solution
+    df = df.rename(columns={'annotation': 'label'})
+
+    df['prediction'] = submission['annotation']
+    # Check for correct 'authentic' label
+    authentic_indices = (df['label'] == 'authentic') | (df['prediction'] == 'authentic')
+    df['image_score'] = ((df['label'] == df['prediction']) & authentic_indices).astype(float)
+
+    df.loc[~authentic_indices, 'image_score'] = df.loc[~authentic_indices].apply(
+        lambda row: evaluate_single_image(row['label'], row['prediction'], row['shape']), axis=1
+    )
+    return float(np.mean(df['image_score']))
+
 
 
 def compute_pos_weight(
@@ -252,12 +378,16 @@ print("DEVICE: ", DEVICE)
 # ## 2) Paths & Params
 
 # %%
+print(aikim12345689_smp_unet_pytorch_smp2_4_path)
+
+# %%
 from pathlib import Path
 import os
 
 COMP_DIR = recodai_luc_scientific_image_forgery_detection_path
 TEST_DIR = os.path.join(COMP_DIR, "test_images")
 TRAIN_DIR = os.path.join(COMP_DIR, "train_images")
+MODEL_PATH = os.path.join(aikim12345689_smp_unet_pytorch_smp2_4_path, "SMP_UNet.pth")
 
 # Output
 OUT_DIR = "/kaggle/working"
@@ -283,7 +413,10 @@ THRESHOLD = 0.5
 LOW_CONF_MAX_PROB = 0.06
 LOW_VIZ_THR = 0.04
 LOW_CONF_MIN_PIXEL = 128
-MIN_AREA = 16
+MIN_AREA = 64
+THRESHOLD = 0.5
+MIN_AREA_RATIO = 0.001
+MIN_AREA = int((IMG_SIZE * IMG_SIZE) * MIN_AREA_RATIO)
 TRAIN_SAMPLE_NUM = None
 TEST_SAMPLE_NUM = None
 
@@ -296,7 +429,9 @@ NUM_WORKERS = 4 if torch.cuda.is_available() and "Windows" not in platform.platf
 print("COMP_DIR: ", COMP_DIR)
 print("TEST_DIR: ", TEST_DIR)
 print("TRAIN_DIR: ", TRAIN_DIR)
+print("MODEL_PATH: ", MODEL_PATH)
 print("SUB_PATH: ", SUB_PATH)
+print("MODEL_PATH is exists: ", os.path.exists(MODEL_PATH))
 
 # %% [markdown]
 # ## 3) Simple U-Net
@@ -683,11 +818,11 @@ def train_one_epoch(model, train_loader, optimizer, device):
         "dice_loss": dice_total / len(train_loader)
     }
 
-def predict(model, test_path, device, img_size=128):
+def predict(model, test_path, device, img_size=128, max_size=None):
     model.eval()
     predictions = {}
 
-    test_files = [f for f in os.listdir(test_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    test_files = [f for f in os.listdir(test_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))][:max_size]
     with torch.no_grad():
         for file in tqdm(test_files, desc="Predicting"):
             case_id = file.split('.')[0]
@@ -708,12 +843,12 @@ def predict(model, test_path, device, img_size=128):
             mask_pred = mask_pred.squeeze().detach().cpu().numpy()
 
             #DEBUG
-            print("[DEBUG] Forged pixel num before PostProcessing: ", (mask_pred > 0.5).astype(np.uint8).sum())
+            print("[DEBUG] Forged pixel num before PostProcessing: ", (mask_pred > THRESHOLD).astype(np.uint8).sum())
             if is_low_confidence(mask_pred):
                 print("DEBUG: low_confidence")
                 mask_pred  = np.zeros_like(mask_pred)
 
-            mask_pred = (mask_pred > 0.5).astype(np.uint8)
+            mask_pred = (mask_pred > THRESHOLD).astype(np.uint8)
             #후에 bilinear사용 고려
             mask_pred = cv2.resize(mask_pred, (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST) # (W, H)
 
@@ -796,15 +931,20 @@ if __name__ == "__main__":
 
     optimizer = optimizer_cls(model.parameters(), lr=LR)
 
-    #Train
-    print(f"\n[3/5] Training for {NUM_EPOCHS} epochs...")
-    for epoch in range(NUM_EPOCHS):
-        loss = train_one_epoch(model, train_loader, optimizer, DEVICE)
-        print(f"Epoch {epoch + 1}/{NUM_EPOCHS} - TOTAL Loss: {loss['total_loss']:.4f} BCE Loss: {loss['bce_loss']:.4f} Dice Loss: {loss['dice_loss']}")
+    if os.path.exists(MODEL_PATH):
+        print(f"\nLoading pretrained model from {MODEL_PATH}...")
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    else:
+        print("\nNo pretrained model found, training from scratch.")
+        #Train
+        print(f"\n[3/5] Training for {NUM_EPOCHS} epochs...")
+        for epoch in range(NUM_EPOCHS):
+            loss = train_one_epoch(model, train_loader, optimizer, DEVICE)
+            print(f"Epoch {epoch + 1}/{NUM_EPOCHS} - TOTAL Loss: {loss['total_loss']:.4f} BCE Loss: {loss['bce_loss']:.4f} Dice Loss: {loss['dice_loss']}")
 
     # Save
     print("\n[4/5] Saving model...")
-    torch.save(model.state_dict(), "smp_model.pth")
+    torch.save(model.state_dict(), "fast_model.pth")
 
 
     #Predict
@@ -841,5 +981,68 @@ if __name__ == "__main__":
 
 # %% [markdown]
 # # **Visualize**
+
+# %%
+import matplotlib.pyplot as plt
+
+predictions = predict(model, paths['train_forged'], DEVICE, IMG_SIZE, max_size=4)
+sample_ids = list(predictions.keys())[:4]
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+axes = axes.flatten()
+
+for i, case_id in enumerate(sample_ids):
+    case_id = str(case_id)
+    base_dir = paths['train_forged']
+
+    # 지원할 확장자 목록
+    extensions = [".jpg", ".png", ".jpeg"]
+
+    # 존재하는 확장자 찾기
+    img_path = None
+    for ext in extensions:
+        candidate = os.path.join(base_dir, f"{case_id}{ext}")
+        if os.path.exists(candidate):
+            img_path = candidate
+            break
+    if img_path is None:
+        print(f"Image for case_id {case_id} not found.")
+        continue
+
+    img = cv2.imread(img_path)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # GT (정답 마스크)
+    gt_path = os.path.join(paths['train_masks'], f"{case_id}.npy")
+    gt = np.load(gt_path)
+    if gt.ndim == 3:
+        gt = gt.max(axis=0)
+
+    # RLE decode
+    pred_mask = json.loads(predictions[str(case_id)])
+    if pred_mask == "authentic":
+        pred_mask = np.zeros_like(gt)
+    pred_mask = np.asarray(pred_mask, dtype=np.int32)
+    pred_mask = _rle_decode_jit(pred_mask, img.shape[0], img.shape[1]).reshape(img.shape[:2], order='F')
+
+    # 오버레이
+    overlay = img_rgb.copy()
+    overlay[(gt > 0) & (pred_mask == 0)] = [0, 255, 0]      # 정답만 있는 곳 (초록)
+    overlay[(pred_mask > 0) & (gt == 0)] = [255, 0, 0]      # 예측만 있는 곳 (빨강)
+    overlay[(pred_mask > 0) & (gt > 0)] = [255, 255, 0]     # 겹치는 곳 (노랑)
+
+    axes[i].imshow(overlay)
+    axes[i].set_title(f"Train {case_id}", fontsize=14)
+    axes[i].axis("off")
+
+    # 시각화
+    axes[i].imshow(overlay)
+    axes[i].set_title(f"Test {case_id}", fontsize=14)
+    axes[i].axis('off')
+
+
+
+plt.tight_layout()
+plt.show()
 
 

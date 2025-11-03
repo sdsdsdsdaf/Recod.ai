@@ -1,13 +1,10 @@
 import segmentation_models_pytorch as smp
 import torch
+import pandas as pd
+import os
 
-model = smp.Unet(
-    encoder_name="efficientnet-b3",     # backbone
-    encoder_weights="imagenet",         # pretrained 가중치
-    in_channels=3,                      # 입력 채널 수 (RGB 이미지)
-    classes=1,                          # 출력 채널 수 (binary mask)
-    activation=None,                    # ⚠️ sigmoid는 loss 함수 쪽에서 처리
-)
+dir = r'C:\Users\user\.cache\kagglehub\competitions\recodai-luc-scientific-image-forgery-detection'
 
-print(model.state_dict().keys())
-model.load_state_dict(torch.load("fast_model.pth"))
+
+df = pd.read_csv(os.path.join(dir,'sample_submission.csv'))
+print(df.info())
