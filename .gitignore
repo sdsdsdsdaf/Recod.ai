@@ -1,6 +1,7 @@
 # Model checkpoints and data
 *.pth
 *.h5
+*.pkl
 
 # Python cache
 __pycache__/
@@ -11,3 +12,4 @@ __pycache__/
 
 /**/*.pth
 /**/*.h5
+/**/*.pkl

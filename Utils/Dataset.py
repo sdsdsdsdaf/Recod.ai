@@ -3,6 +3,7 @@ from torch.utils.data import Dataset
 import os, cv2, torch
 import numpy as np
 from tqdm.auto import tqdm
+from Utils.utils import preprocessing
 
 class FastDataset(Dataset):
     def __init__(self, authentic_path, forged_path, masks_path,
@@ -158,7 +159,7 @@ class HybridDataset(Dataset):
                 min_h = min(min_h, img.shape[0])
                 min_p = min(min_p, img.shape[0] * img.shape[1])
 
-                img = cv2.resize(img, (self.img_size, self.img_size), interpolation=self.interpolation).astype(np.float32) / 255.0
+                img = preprocessing(img, self.img_size, interpolation=self.interpolation, div=255.0)
                 img = np.transpose(img, (2, 0, 1))  # [C,H,W]
 
                

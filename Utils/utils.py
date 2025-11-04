@@ -17,13 +17,14 @@ import random
 from collections import defaultdict
 from torch.amp import autocast, GradScaler
 from datetime import timedelta
+import gc
 
 class ParticipantVisibleError(Exception):
     pass
 
 
 def str_to_device(device:Union[torch.device,str]) -> torch.device:
-    if not isinstance(device, torch.device) and isinstance(device, str):
+    if not (isinstance(device, torch.device) or isinstance(device, str)):
         raise ValueError("device must torch.device or str")
     elif isinstance(device, str):
         device = torch.device(device)
@@ -44,7 +45,7 @@ def postprocessing(proba_map:np.ndarray, original_size:tuple[int, int], threshol
         proba_map = np.zeros_like(proba_map)
 
     #후에 bilinear사용 고려
-    mask_pred = cv2.resize(proba_map, (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST) # (W, H)
+    proba_map = cv2.resize(proba_map, (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST) # (W, H)
     mask_pred = (proba_map > threshold).astype(np.uint8)
 
     #PostProcessing
@@ -362,12 +363,12 @@ def is_low_confidence(prob_map, low_conf_max_prob=0.5, low_viz_thr=0.06, low_con
     if float(prob_map.max()) >= low_conf_max_prob: #일단 “low confidence 아님으로 판단
         return False
     cover = int((prob_map >= low_viz_thr).sum()) #검출됨
-    return cover < low_viz_thr
+    return cover < low_conf_min_pixel
 
 
 def train(
         model: torch.nn.Module, train_loader, val_loader, optimizer, epoch,
-        device, cls_loss_fn, dice_loss_fn, alpha=0.5, beta=0.5, scheduler=None,
+        device, cls_loss_fn, dice_loss_fn, alpha=0.5, beta=0.5, loss_scaler=8, scheduler=None,
         interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area=100,
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, # PostProcessing Setting,
         fold=None, use_amp=False,
@@ -391,15 +392,15 @@ def train(
 
     for E in range(1, epoch + 1):
         epoch_start_time = time()
-        losses = train_one_epoch(model, train_loader, optimizer, device, cls_loss_fn, dice_loss_fn, scheduler, alpha, beta, scaler)
-        print(f"[{E}/{epoch}] TRAIN TOTAL LOSS: {losses['loss_total']:.4f} CLS LOSS: {losses['loss_cls']:.4f} DICE LOSS: {losses['loss_dice']:.4f}")
+        losses = train_one_epoch(model, train_loader, optimizer, device, cls_loss_fn, dice_loss_fn, scheduler, alpha, beta, loss_scaler, scaler)
+        print(f"[{E}/{epoch}] TRAIN TOTAL LOSS: {losses['loss_total']:.4f} CLS LOSS: {losses['loss_cls']:.4f} SCALING CLS LOSS: {loss_scaler*losses['loss_cls']:.4f} DICE LOSS: {losses['loss_dice']:.4f}")
         for k, v in losses.items():
                     train_loss_log_dict[k].append(v)
         if val_loader is None:
             continue
 
-        metric_score = evaluate(model, val_loader, device, cls_loss_fn, dice_loss_fn, alpha, beta, interpolation, threshold, min_area, low_conf_max_prob, low_viz_thr, low_conf_min_pixel, scaler)
-        print(f"[{E}/{epoch}] VAL F1: {metric_score['f1_score']:.4f} TOTAL LOSS: {metric_score['loss_total']:.4f} CLS LOSS: {metric_score['loss_cls']:.4f} DICE LOSS: {metric_score['loss_dice']:.4f}")
+        metric_score = evaluate(model, val_loader, device, cls_loss_fn, dice_loss_fn, alpha, beta, loss_scaler, interpolation, threshold, min_area, low_conf_max_prob, low_viz_thr, low_conf_min_pixel, scaler)
+        print(f"[{E}/{epoch}] VAL F1: {metric_score['f1_score']:.4f} TOTAL LOSS: {metric_score['loss_total']:.4f} CLS LOSS: {metric_score['loss_cls']:.4f}  SCALING CLS LOSS: {loss_scaler*metric_score['loss_cls']:.4f} DICE LOSS: {metric_score['loss_dice']:.4f}")
         for k, v in metric_score.items():
             val_loss_log_dict[k].append(v)
         if scheduler and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -417,9 +418,9 @@ def train(
             rank = sorted_best.index(metric_score['f1_score']) + 1
 
             if fold is not None:
-                save_path = os.path.join("Weights", f"FOLD{fold}", f"best{rank}_{E}.pth")
+                save_path = os.path.join("Weights", f"FOLD{fold}", f"best{rank}.pth")
             else:
-                save_path = os.path.join("Weights", f"best{rank}_{E}.pth")
+                save_path = os.path.join("Weights", f"best{rank}.pth")
             
             try:
                 torch.save(model.state_dict(), save_path)
@@ -429,13 +430,22 @@ def train(
                 print(f"⚠️ Failed to save model at {save_path}: {e}")
         epoch_end_time = time()
         print(f"TIME [EPOCH {E}]: {timedelta(seconds=epoch_end_time - epoch_start_time)}")
+
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        try:
+            torch.cuda.memory._free_cached_blocks()  # PyTorch 2.6에서 동작
+        except Exception:
+            pass
     return {'train_loss': train_loss_log_dict, 'val_loss': val_loss_log_dict, 'f1_score': f1_log_list}
 
 
 
 @torch.no_grad()
 def evaluate(
-        model, val_loader, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, alpha=0.5, beta=0.5,
+        model, val_loader, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, alpha=0.5, beta=0.5, loss_scaler=8,
         interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area=100,
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, scaler=None,
     ):
@@ -453,7 +463,7 @@ def evaluate(
             logit_map = model(imgs)
             cls_loss = cls_loss_fn(logit_map, masks)
             dice_loss = dice_loss_fn(logit_map, masks)
-            loss = alpha * cls_loss + beta * dice_loss
+            loss = alpha * cls_loss*loss_scaler + beta * dice_loss
 
         total_loss += loss.item()
         cls_total += cls_loss.item()
@@ -475,7 +485,7 @@ def evaluate(
             gt_instances = mask_to_instances(gt)
 
             case_id = os.path.splitext(os.path.basename(img_path))[0]
-            solution['case_id'].append(case_id)
+            solution['case_id'].append(int(case_id))
             rle_str = rle_encode(gt_instances)
             solution['annotation'].append("authentic" if len(gt_instances) == 0 else rle_str)
             solution['shape'].append(json.dumps([h,w]))
@@ -490,15 +500,22 @@ def evaluate(
         max_size=None, interpolation=interpolation, threshold=threshold, min_area=min_area,
         low_conf_max_prob=low_conf_max_prob, low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel,
     )
-    
+    del img, imgs, masks, logit_map, cls_loss, dice_loss, loss
+    torch.cuda.empty_cache()
+
+    solution['case_id'] = solution['case_id']
+    prediction['case_id'] = prediction['case_id']
 
     if prediction['case_id'] != solution['case_id']:
+        print(prediction['case_id'])
+        print(solution['case_id'])
         raise ValueError("Prediction`s Key and Solution`s key must be match")
     
     solution_df = pd.DataFrame(solution)
     prediction_df = pd.DataFrame(prediction)
 
     score_ = score(solution_df, prediction_df, row_id_column_name='case_id')
+
     return {"f1_score": score_, "loss_total": total_loss, "loss_cls": cls_total, "loss_dice": dice_total}
 
     
@@ -543,7 +560,7 @@ def mask_path2img_path(mask_path, is_forged):
 
 
 
-def train_one_epoch(model, train_loader, optimizer, device:Union[torch.device,str], bce_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, scaler: Optional[torch.amp.GradScaler] = None) -> dict[str, float]:
+def train_one_epoch(model, train_loader, optimizer, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, loss_scaler=None, scaler: Optional[torch.amp.GradScaler] = None) -> dict[str, float]:
 
     model.train()
     total_loss = 0
@@ -564,9 +581,9 @@ def train_one_epoch(model, train_loader, optimizer, device:Union[torch.device,st
 
         with autocast(device_type=device_type, enabled=scaler is not None):
             outputs = model(imgs)
-            bce_loss = bce_loss_fn(outputs, masks)
+            cls_loss = cls_loss_fn(outputs, masks)
             dice_loss = dice_loss_fn(outputs, masks)
-            loss = alpha * bce_loss + beta * dice_loss
+            loss = alpha * cls_loss*loss_scaler + beta * dice_loss
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -577,7 +594,7 @@ def train_one_epoch(model, train_loader, optimizer, device:Union[torch.device,st
             optimizer.step()
 
         total_loss += loss.item()
-        bce_total += bce_loss.item()
+        bce_total += cls_loss.item()
         dice_total += dice_loss.item()
 
     return {
@@ -626,7 +643,8 @@ def predict(model, test_path, device, test_path_file_list=None, img_size=128, ma
 
             proba_map = proba_map.squeeze().cpu().numpy()  # (H, W)
             mask_pred = postprocessing(proba_map, original_size, threshold, low_conf_max_prob, low_viz_thr, low_conf_min_pixel)
-        
+            case_id = int(case_id)
+
             #후에 resize하기 전으로 변경 (img_size 똑같을 때)
             if mask_pred.sum() < min_area:
                 predictions['case_id'].append(case_id)
