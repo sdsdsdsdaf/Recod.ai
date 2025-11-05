@@ -11,6 +11,24 @@ from datetime import timedelta
 from time import time
 
 
+# IMPORTANT: SOME KAGGLE DATA SOURCES ARE PRIVATE
+# RUN THIS CELL IN ORDER TO IMPORT YOUR KAGGLE DATA SOURCES.
+import kagglehub
+kagglehub.login()
+
+
+# IMPORTANT: RUN THIS CELL IN ORDER TO IMPORT YOUR KAGGLE DATA SOURCES,
+# THEN FEEL FREE TO DELETE THIS CELL.
+# NOTE: THIS NOTEBOOK ENVIRONMENT DIFFERS FROM KAGGLE'S PYTHON
+# ENVIRONMENT SO THERE MAY BE MISSING LIBRARIES USED BY YOUR
+# NOTEBOOK.
+
+recodai_luc_scientific_image_forgery_detection_path = kagglehub.competition_download('recodai-luc-scientific-image-forgery-detection')
+
+print('Data source import complete.')
+
+
+
 def cross_val_score(
         model_cls,
         k:int=5,
@@ -93,10 +111,12 @@ if __name__ == "__main__":
     import os
     import platform
 
-    COMP_DIR = r"C:\Users\user\.cache\kagglehub\competitions\recodai-luc-scientific-image-forgery-detection"
+    COMP_DIR = recodai_luc_scientific_image_forgery_detection_path
     TEST_DIR = os.path.join(COMP_DIR, "test_images")
     TRAIN_DIR = os.path.join(COMP_DIR, "train_images")
-    MODEL_PATH = os.path.join(r"C:\Users\user\.cache\kagglehub\models\aikim12345689\smp-unet\PyTorch\smp2\4", "SMP_UNet.pth")
+    BASE_PATH = r"Weights"
+    BEST_FOLD_PATH = os.path.join("FOLD2", "best1.pth")
+    MODEL_PATH = os.path.join(BASE_PATH, BEST_FOLD_PATH)
 
     # Output
     OUT_DIR = "/kaggle/working"
