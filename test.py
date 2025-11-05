@@ -2,7 +2,7 @@ import segmentation_models_pytorch as smp
 import torch
 import pandas as pd
 import os
-import cv2 as test
+import transformers as test
 dir = r'C:\Users\user\.cache\kagglehub\competitions\recodai-luc-scientific-image-forgery-detection'
 
 

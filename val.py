@@ -9,12 +9,12 @@ from segmentation_models_pytorch.losses import FocalLoss
 import cv2
 from datetime import timedelta
 from time import time
-
+from transformers import get_cosine_schedule_with_warmup
 
 # IMPORTANT: SOME KAGGLE DATA SOURCES ARE PRIVATE
 # RUN THIS CELL IN ORDER TO IMPORT YOUR KAGGLE DATA SOURCES.
-import kagglehub
-kagglehub.login()
+# import kagglehub
+# kagglehub.login()
 
 
 # IMPORTANT: RUN THIS CELL IN ORDER TO IMPORT YOUR KAGGLE DATA SOURCES,
@@ -23,10 +23,7 @@ kagglehub.login()
 # ENVIRONMENT SO THERE MAY BE MISSING LIBRARIES USED BY YOUR
 # NOTEBOOK.
 
-recodai_luc_scientific_image_forgery_detection_path = kagglehub.competition_download('recodai-luc-scientific-image-forgery-detection')
-
-print('Data source import complete.')
-
+#recodai_luc_scientific_image_forgery_detection_path = kagglehub.competition_download('recodai-luc-scientific-image-forgery-detection')
 
 
 def cross_val_score(
@@ -53,6 +50,7 @@ def cross_val_score(
         low_conf_min_pixel: int = 128,
         optimizer_cls=torch.optim.Adam,
         scheduler_cls=None,
+        scheduler_params=None,
         use_amp=False,
         **kwargs,
     ):
@@ -67,14 +65,25 @@ def cross_val_score(
         print(f"\nFOLD [{fold + 1}/{k}]...")
         fold_start_time = time()
 
-        model = model_cls(**kwargs)
-        optimizer = optimizer_cls(model.parameters(), lr=lr)
-        scheduler = scheduler_cls(optimizer) if scheduler_cls else None
         train_ds = Subset(dataset, train_idx)
         val_ds = Subset(dataset, val_idx)
 
         train_loader = DataLoader(dataset=train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=ues_pin_memory)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=ues_pin_memory)
+
+        total_steps = len(train_loader) * epoch
+        scheduler_config["scheduler_params"]["num_warmup_steps"] = int(total_steps * 0.1)
+        scheduler_config["scheduler_params"]["num_training_steps"] = total_steps
+
+        model = model_cls(**kwargs)
+        
+        #TODO 후에 하드코딩아닌 함수인자로 받기
+        optimizer = optimizer = optimizer_cls([
+            {"params": model.encoder.parameters(), "lr": 1e-4},   # 천천히 미세조정
+            {"params": model.decoder.parameters(), "lr": 1e-3},   # 크게 학습
+            {"params": model.segmentation_head.parameters(), "lr": 1e-3},  # 크게 학습
+        ], weight_decay=1e-3)
+        scheduler = scheduler_cls(optimizer, **scheduler_params) if scheduler_cls else None
 
         model = model.to(device)
         log[f'fold{fold + 1}'] = train(
@@ -111,12 +120,10 @@ if __name__ == "__main__":
     import os
     import platform
 
-    COMP_DIR = recodai_luc_scientific_image_forgery_detection_path
+    COMP_DIR = r"C:\Users\user\.cache\kagglehub\competitions\recodai-luc-scientific-image-forgery-detection"
     TEST_DIR = os.path.join(COMP_DIR, "test_images")
     TRAIN_DIR = os.path.join(COMP_DIR, "train_images")
-    BASE_PATH = r"Weights"
-    BEST_FOLD_PATH = os.path.join("FOLD2", "best1.pth")
-    MODEL_PATH = os.path.join(BASE_PATH, BEST_FOLD_PATH)
+    MODEL_PATH = os.path.join(r"C:\Users\user\.cache\kagglehub\models\aikim12345689\smp-unet\PyTorch\smp2\4", "SMP_UNet.pth")
 
     # Output
     OUT_DIR = "/kaggle/working"
@@ -147,6 +154,14 @@ if __name__ == "__main__":
     beta = 1 - alpha
     loss_scaler = 8
     optimizer_cls = torch.optim.AdamW
+
+    scheduler_config = {
+        "scheduler_cls": get_cosine_schedule_with_warmup,
+        "scheduler_params": {
+            "num_warmup_steps": None,   # 아래에서 계산됨
+            "num_training_steps": None, # 아래에서 계산됨
+        }
+    }
 
     #Post Processing HyperParams
     THRESHOLD = 0.5
@@ -200,7 +215,7 @@ if __name__ == "__main__":
         alpha=alpha, beta=beta, epoch=NUM_EPOCHS, interpolation=INTERPOLATION,
         threshold=THRESHOLD, min_area=MIN_AREA, low_conf_max_prob=LOW_CONF_MAX_PROB,
         low_viz_thr=LOW_VIZ_THR, low_conf_min_pixel=LOW_CONF_MIN_PIXEL, lr=LR,
-        optimizer_cls=optimizer_cls, scheduler_cls=None, use_amp=USE_AMP,
+        optimizer_cls=optimizer_cls, scheduler_cls=None, scheduler_params=scheduler_config, use_amp=USE_AMP,
 
         encoder_name="efficientnet-b3", encoder_weights="imagenet", #모델 파라미터
         in_channels=3, classes=1, activation=None,                    
