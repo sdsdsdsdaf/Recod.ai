@@ -21,6 +21,7 @@ def cross_val_score(
         num_workers:int=0,
         device=None,
         batch_size=16,
+        lr=1e-3,
         cls_loss=nn.BCEWithLogitsLoss,
         dice_loss=smp.losses.DiceLoss,
         alpha=0.5,
@@ -42,18 +43,17 @@ def cross_val_score(
         raise ValueError("optimizer must be provided")
 
     kfold = KFold(n_splits=k, shuffle=True, random_state=random_state)
-    result = []
+    log = {}
     for fold, (train_idx, val_idx) in enumerate(kfold.split(dataset)):
 
         print(f"\nFOLD [{fold + 1}/{k}]...")
         fold_start_time = time()
 
         model = model_cls(**kwargs)
-        optimizer = optimizer_cls(model.parameters())
+        optimizer = optimizer_cls(model.parameters(), lr=lr)
         scheduler = scheduler_cls(optimizer) if scheduler_cls else None
         train_ds = Subset(dataset, train_idx)
         val_ds = Subset(dataset, val_idx)
-        log = {}
 
         train_loader = DataLoader(dataset=train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=ues_pin_memory)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=ues_pin_memory)
@@ -110,23 +110,23 @@ if __name__ == "__main__":
     IMG_SIZE = 256
     BATCH_SIZE = 32
     NUM_EPOCHS = 50
-    LR = 1e-4
+    LR = 1e-3
     POS_W = torch.tensor(1) # Resized
     # POS_W = torch.tensor(23.37) # Original
     #cls_loss = nn.BCEWithLogitsLoss(weight=POS_W)
     cls_loss = FocalLoss(
         mode='binary',      # or 'multiclass', 'multilabel'
-        alpha=0.75,         # class balance term
-        gamma=2.0,          # focusing parameter
+        alpha=0.8,         # class balance term
+        gamma=1.5,          # focusing parameter
         ignore_index=None,
         normalized=False,
         reduction='mean'
     )
     dice_loss = smp.losses.DiceLoss(mode="binary", from_logits=True)
-    alpha = 0.5  # Weight for combining BCE and Dice losses
+    alpha = 0.75  # Weight for combining BCE and Dice losses
     beta = 1 - alpha
     loss_scaler = 8
-    optimizer_cls = torch.optim.Adam
+    optimizer_cls = torch.optim.AdamW
 
     #Post Processing HyperParams
     THRESHOLD = 0.5
@@ -179,7 +179,7 @@ if __name__ == "__main__":
         cls_loss=cls_loss, dice_loss=dice_loss, loss_scaler=loss_scaler,
         alpha=alpha, beta=beta, epoch=NUM_EPOCHS, interpolation=INTERPOLATION,
         threshold=THRESHOLD, min_area=MIN_AREA, low_conf_max_prob=LOW_CONF_MAX_PROB,
-        low_viz_thr=LOW_VIZ_THR, low_conf_min_pixel=LOW_CONF_MIN_PIXEL,
+        low_viz_thr=LOW_VIZ_THR, low_conf_min_pixel=LOW_CONF_MIN_PIXEL, lr=LR,
         optimizer_cls=optimizer_cls, scheduler_cls=None, use_amp=USE_AMP,
 
         encoder_name="efficientnet-b3", encoder_weights="imagenet", #모델 파라미터
