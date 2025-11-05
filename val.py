@@ -79,9 +79,9 @@ def cross_val_score(
         
         #TODO 후에 하드코딩아닌 함수인자로 받기
         optimizer = optimizer = optimizer_cls([
-            {"params": model.encoder.parameters(), "lr": 1e-4},   # 천천히 미세조정
-            {"params": model.decoder.parameters(), "lr": 1e-3},   # 크게 학습
-            {"params": model.segmentation_head.parameters(), "lr": 1e-3},  # 크게 학습
+            {"params": model.encoder.parameters(), "lr": 0.1*lr},   # 천천히 미세조정
+            {"params": model.decoder.parameters(), "lr": lr},   # 크게 학습
+            {"params": model.segmentation_head.parameters(), "lr": lr},  # 크게 학습
         ], weight_decay=1e-3)
         scheduler = scheduler_cls(optimizer, **scheduler_params) if scheduler_cls else None
 

@@ -394,7 +394,7 @@ def train(
         epoch_start_time = time()
         losses = train_one_epoch(model, train_loader, optimizer, device, cls_loss_fn, dice_loss_fn, scheduler, alpha, beta, loss_scaler, scaler)
         current_lr = optimizer.param_groups[0]["lr"]
-        print(f"[{E}/{epoch}] TRAIN TOTAL LOSS: {losses['loss_total']:.4f} CLS LOSS: {losses['loss_cls']:.4f} DICE LOSS: {losses['loss_dice']:.4f} SCALING CLS LOSS: {alpha*loss_scaler*losses['loss_cls']:.4f} SCALING DICE LOSS: {beta*losses['loss_dice']:.4f}")
+        print(f"[{E}/{epoch}] TRAIN TOTAL LOSS: {losses['loss_total']:.4f} CLS LOSS: {losses['loss_cls']:.4f} DICE LOSS: {losses['loss_dice']:.4f} SCALING CLS LOSS: {alpha*loss_scaler*losses['loss_cls']:.4f} SCALING DICE LOSS: {beta*losses['loss_dice']:.4f} CURRENT LR: {current_lr:.7f}")
         for k, v in losses.items():
                     train_loss_log_dict[k].append(v)
         if val_loader is None:
