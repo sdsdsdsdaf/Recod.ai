@@ -18,6 +18,7 @@ from collections import defaultdict
 from torch.amp import autocast, GradScaler
 from datetime import timedelta
 import gc
+from pytorch_toolbelt import losses as L
 
 class ParticipantVisibleError(Exception):
     pass
@@ -37,6 +38,7 @@ def preprocessing(img:np.ndarray, img_size:int, interpolation=cv2.INTER_NEAREST,
     """
     return cv2.resize(img.astype(np.float32) / div, (img_size, img_size), interpolation=interpolation)
     
+"""
 def postprocessing(proba_map:np.ndarray, original_size:tuple[int, int], threshold:float, low_conf_max_prob:float, low_viz_thr:float, low_conf_min_pixel:int):
     # DEBUG
     # print("[DEBUG] Forged pixel num before PostProcessing: ", (proba_map > threshold).astype(np.uint8).sum())
@@ -54,6 +56,32 @@ def postprocessing(proba_map:np.ndarray, original_size:tuple[int, int], threshol
     mask_pred = cv2.morphologyEx(mask_pred, cv2.MORPH_CLOSE, kernel)
 
     return mask_pred
+"""
+
+def postprocessing(proba_map: np.ndarray,
+                   original_size: tuple[int, int],
+                   threshold: float,
+                   low_conf_max_prob: float,
+                   low_viz_thr: float,
+                   low_conf_min_pixel: int):
+
+    # 1) Low confidence filtering stays the same
+    if is_low_confidence(proba_map, low_conf_max_prob, low_viz_thr, low_conf_min_pixel):
+        return np.zeros(original_size, dtype=np.uint8)
+
+    # 2) Threshold FIRST (in model resolution → cheap)
+    mask = (proba_map > threshold).astype(np.uint8)
+
+    # 3) Noise cleanup (in small resolution → super cheap)
+    kernel = np.ones((3,3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # 4) Now resize to original resolution (only once)
+    mask = cv2.resize(mask, (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST) # (W, H)
+
+
+    return mask
 
 @numba.jit(nopython=True)
 def _rle_encode_jit(x: npt.NDArray, fg_val: int = 1) -> list[int]:
@@ -68,7 +96,7 @@ def _rle_encode_jit(x: npt.NDArray, fg_val: int = 1) -> list[int]:
         prev = b
     return run_lengths
 
-
+'''
 def rle_encode(masks: list[npt.NDArray], fg_val: int = 1) -> str:
     """
     Adapted from contrails RLE https://www.kaggle.com/code/inversion/contrails-rle-submission
@@ -77,7 +105,14 @@ def rle_encode(masks: list[npt.NDArray], fg_val: int = 1) -> str:
     Returns: run length encodings as a string, with each RLE JSON-encoded and separated by a semicolon.
     """
     return ';'.join([json.dumps(_rle_encode_jit(x, fg_val)) for x in masks])
+'''
 
+def rle_encode(masks: list[np.ndarray], fg_val: int = 1) -> str:
+    encoded_strings = []
+    for x in masks:
+        rl = _rle_encode_jit(x, fg_val)  # ✅ 공식 함수 그대로
+        encoded_strings.append("[" + ", ".join(str(v) for v in rl) + "]")  # ✅ json과 동일 포맷
+    return ";".join(encoded_strings)    
 
 @numba.njit
 def _rle_decode_jit(mask_rle: npt.NDArray, height: int, width: int) -> npt.NDArray:
@@ -248,6 +283,63 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
     return float(np.mean(df['image_score']))
 
 
+def freeze_encoder_after_epoch(
+    model, current_epoch, freeze_at: int, optimizer=None, n_layers: Optional[int] = None, new_lr_ratio: Optional[float] = None,
+):
+    """
+    Freeze encoder parameters after a given epoch.
+    Optionally keep the last N stages (layers) unfrozen.
+
+    Args:
+        model (torch.nn.Module): smp.Unet model instance
+        current_epoch (int): current epoch index
+        freeze_at (int): epoch index to start freezing
+        optimizer (torch.optim.Optimizer, optional): optimizer to rebuild after freezing
+        n_layers (int, optional): number of last encoder stages to keep trainable.
+                                 Default=None → freeze entire encoder.
+    """
+    if current_epoch == freeze_at:
+        print(f"🔒 Freezing encoder at epoch {freeze_at}...")
+
+        # encoder 내부 stage 목록 가져오기
+        try:
+            stages = model.encoder.get_stages()
+        except AttributeError:
+            # 일부 encoder는 get_stages() 대신 _blocks, features 등 이름 다름
+            stages = list(model.encoder.children())
+
+        if n_layers is None or n_layers <= 0:
+            # 전체 encoder freeze
+            for param in model.encoder.parameters():
+                param.requires_grad = False
+            print("➡️ Entire encoder frozen.")
+        else:
+            # 마지막 n_layers만 제외하고 freeze
+            num_stages = len(stages)
+            freeze_until = max(0, num_stages - n_layers)
+            for i, stage in enumerate(stages):
+                requires_grad = (i >= freeze_until)  # 뒤쪽 n_layers만 학습
+                for param in stage.parameters():
+                    param.requires_grad = requires_grad
+
+            print(f"➡️ Encoder frozen except for last {n_layers} stage(s).")
+
+        # optimizer 다시 구성 (필요 시)
+        if optimizer is not None:
+            defaults = optimizer.defaults.copy()
+            if new_lr_ratio is not None:
+                defaults["lr"] *= new_lr_ratio
+            optimizer 
+            optimizer = type(optimizer)(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                **optimizer.defaults,
+            )
+            print("🧩 Optimizer reinitialized (encoder params removed).")
+        return optimizer
+
+    return optimizer
+
+
 
 def compute_pos_weight(
     dataset=None,
@@ -328,6 +420,7 @@ def compute_pos_weight(
     return torch.tensor(pos_weight, dtype=torch.float32)
 
 
+
 def mask_to_instances(mask, min_area: int = 1) -> list[np.ndarray]:
     """
     Convert a mask map to individual connected-component masks (instances).
@@ -368,10 +461,10 @@ def is_low_confidence(prob_map, low_conf_max_prob=0.5, low_viz_thr=0.06, low_con
 
 def train(
         model: torch.nn.Module, train_loader, val_loader, optimizer, epoch,
-        device, cls_loss_fn, dice_loss_fn, alpha=0.5, beta=0.5, loss_scaler=8, scheduler=None,
-        interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area=100,
+        device, cls_loss_fn, dice_loss_fn, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=8, scheduler=None,
+        interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.02,
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, # PostProcessing Setting,
-        fold=None, use_amp=False,
+        fold=None, use_amp=False, use_log=False, freeze_epoch=15, freeze_layer=None, after_freeze_lr=None,
     ):
 
     train_loss_log_dict = defaultdict(list)
@@ -380,28 +473,72 @@ def train(
     best1_f1 = 0.0
     best5_f1 = [0.0, 0.0, 0.0, 0.0, 0.0]
     f1_log_list = []
+    log_file = None
     os.makedirs("Weights", exist_ok=True)
     if fold is not None:
         os.makedirs(os.path.join("Weights", f"FOLD{fold}"), exist_ok=True)
 
     if use_amp:
-        scaler = GradScaler()
+        scaler = GradScaler(init_scale=64)
 
     # DEBUG
     print("Scaler is Not None in def Train: ", scaler is not None)
+    
+    if use_log:
+        log_file = open("grad_norm_log.txt", "w")
 
     for E in range(1, epoch + 1):
         epoch_start_time = time()
-        losses = train_one_epoch(model, train_loader, optimizer, device, cls_loss_fn, dice_loss_fn, scheduler, alpha, beta, loss_scaler, scaler)
+        if freeze_epoch is not None and E == freeze_epoch:
+            optimizer = freeze_encoder_after_epoch(model, E, freeze_at=freeze_epoch, optimizer=optimizer, n_layers=freeze_layer, new_lr_ratio=after_freeze_lr)
+        losses = train_one_epoch(
+            model=model, 
+            train_loader=train_loader, 
+            optimizer=optimizer, 
+            device=device, 
+            cls_loss_fn=cls_loss_fn, 
+            dice_loss_fn=dice_loss_fn, 
+            scheduler=scheduler, 
+            alpha=alpha, 
+            beta=beta,
+            gamma=gamma, 
+            loss_scaler=loss_scaler, 
+            scaler=scaler,
+            log_file=log_file,
+        )
         current_lr = optimizer.param_groups[0]["lr"]
-        print(f"[{E}/{epoch}] TRAIN TOTAL LOSS: {losses['loss_total']:.4f} CLS LOSS: {losses['loss_cls']:.4f} DICE LOSS: {losses['loss_dice']:.4f} SCALING CLS LOSS: {alpha*loss_scaler*losses['loss_cls']:.4f} SCALING DICE LOSS: {beta*losses['loss_dice']:.4f} CURRENT LR: {current_lr:.7f}")
+        print(f"[{E}/{epoch}] CLS LOSS: {losses['loss_cls']:.4f} DICE LOSS: {losses['loss_dice']:.4f} IS FORGED IMG LOSS: {losses['loss_img']:.4f} \nSCALING CLS LOSS: {alpha*loss_scaler*losses['loss_cls']:.4f} SCALING DICE LOSS: {beta*losses['loss_dice']:.4f} SCALING IS FORGED IMG LOSS: {gamma*losses['loss_img']:.4f} TRAIN TOTAL LOSS: {losses['loss_total']:.4f} CURRENT LR: {current_lr:.7f}")
         for k, v in losses.items():
                     train_loss_log_dict[k].append(v)
         if val_loader is None:
             continue
 
-        metric_score = evaluate(model, val_loader, device, cls_loss_fn, dice_loss_fn, alpha, beta, loss_scaler, interpolation, threshold, min_area, low_conf_max_prob, low_viz_thr, low_conf_min_pixel, scaler)
-        print(f"[{E}/{epoch}] VAL F1: {metric_score['f1_score']:.4f} TOTAL LOSS: {metric_score['loss_total']:.4f} CLS LOSS: {metric_score['loss_cls']:.4f}  SCALING CLS LOSS: {loss_scaler*metric_score['loss_cls']:.4f} DICE LOSS: {metric_score['loss_dice']:.4f}")
+        metric_score = evaluate(
+            model=model, 
+            val_loader=val_loader, 
+            device=device, 
+            cls_loss_fn=cls_loss_fn, 
+            dice_loss_fn=dice_loss_fn, 
+            alpha=alpha, 
+            beta=beta,
+            gamma=gamma, 
+            loss_scaler=loss_scaler, 
+            interpolation=interpolation, 
+            threshold=threshold, 
+            min_area_ratio=min_area_ratio, 
+            low_conf_max_prob=low_conf_max_prob, 
+            low_viz_thr=low_viz_thr, 
+            low_conf_min_pixel=low_conf_min_pixel, 
+            scaler=scaler)
+        print(f"[{E}/{epoch}] VAL F1: {metric_score['f1_score']:.4f}"
+              f" TRAIN TOTAL LOSS: {metric_score['loss_total']:.4f}"
+              f" CLS LOSS: {metric_score['loss_cls']:.4f} "
+              f" DICE LOSS: {metric_score['loss_dice']:.4f} "
+              f" IS FORGED IMG LOSS: {metric_score['loss_img']:.4f} \n"
+              f" SCALING CLS LOSS: {alpha * loss_scaler * metric_score['loss_cls']:.4f} "
+              f" SCALING DICE LOSS: {beta * metric_score['loss_dice']:.4f} "
+              f" SCALING IS FORGED IMG LOSS: {gamma * metric_score['loss_img']:.4f} "
+            )
         for k, v in metric_score.items():
             val_loss_log_dict[k].append(v)
         if scheduler and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -430,7 +567,7 @@ def train(
             except Exception as e:
                 print(f"⚠️ Failed to save model at {save_path}: {e}")
         epoch_end_time = time()
-        print(f"TIME [EPOCH {E}]: {timedelta(seconds=epoch_end_time - epoch_start_time)}")
+        print(f"[EPOCH {E}/{epoch}] TIME : {timedelta(seconds=epoch_end_time - epoch_start_time)}")
 
         torch.cuda.synchronize()
         gc.collect()
@@ -440,35 +577,57 @@ def train(
             torch.cuda.memory._free_cached_blocks()  # PyTorch 2.6에서 동작
         except Exception:
             pass
+    
+    if use_log:
+        log_file.close()
     return {'train_loss': train_loss_log_dict, 'val_loss': val_loss_log_dict, 'f1_score': f1_log_list}
 
 
 
 @torch.no_grad()
 def evaluate(
-        model, val_loader, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, alpha=0.5, beta=0.5, loss_scaler=8,
-        interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area=100,
+        model, val_loader, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=8,
+        interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002,
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, scaler=None,
     ):
     model.eval()
     total_loss = 0
     cls_total = 0
     dice_total = 0
+    img_total = 0
     solution = {'case_id': [], 'annotation': [], 'shape': []}
     file_path_list = []
+    is_forged_img_loss_fn = torch.nn.BCEWithLogitsLoss()
     
     for imgs, masks, mask_path, is_forged in tqdm(val_loader, desc="Calculating Loss", leave=False):
 
-        imgs, masks = imgs.to(device, non_blocking=True), masks.to(device, non_blocking=True)
+        imgs, masks, is_forged = imgs.to(device, non_blocking=True), masks.to(device, non_blocking=True), is_forged.to(device, non_blocking=True)
+        masks = masks.squeeze()
         with autocast(device_type=device.type, enabled=scaler is not None):
-            logit_map = model(imgs)
+            if getattr(model, 'classification_head', None) is not None:
+                logit_map, is_forged_logit = model(imgs)
+                logit_map = logit_map.squeeze()
+                is_forged_logit = is_forged_logit.squeeze()
+                
+
+            else:
+                logit_map = model(imgs)
+
+        logit_map, masks = logit_map.float(), masks.float()
+
+        if getattr(model, 'classification_head', None) is not None:
+            is_forged_logit, is_forged = is_forged_logit.float(), is_forged.float()
             cls_loss = cls_loss_fn(logit_map, masks)
             dice_loss = dice_loss_fn(logit_map, masks)
-            loss = alpha * cls_loss*loss_scaler + beta * dice_loss
+            img_loss = is_forged_img_loss_fn(is_forged_logit, is_forged)
+            loss = alpha * cls_loss*loss_scaler + beta * dice_loss + img_loss*gamma
 
         total_loss += loss.item()
         cls_total += cls_loss.item()
         dice_total += dice_loss.item()
+        img_total += img_loss.item() if hasattr(model, 'classification_head') else 0
+
+
 
         for img, mask_path, is_forged in zip(imgs, mask_path, is_forged):
 
@@ -495,10 +654,12 @@ def evaluate(
     total_loss = total_loss / len(val_loader)
     cls_total = cls_total / len(val_loader)
     dice_total = dice_total / len(val_loader)
+    img_total = img_total / len(val_loader)
+
 
     prediction= predict(
         model, None, device, test_path_file_list=file_path_list, img_size=img.shape[1],
-        max_size=None, interpolation=interpolation, threshold=threshold, min_area=min_area,
+        max_size=None, interpolation=interpolation, threshold=threshold, min_area_ratio=min_area_ratio,
         low_conf_max_prob=low_conf_max_prob, low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel,
     )
     del img, imgs, masks, logit_map, cls_loss, dice_loss, loss
@@ -517,7 +678,7 @@ def evaluate(
 
     score_ = score(solution_df, prediction_df, row_id_column_name='case_id')
 
-    return {"f1_score": score_, "loss_total": total_loss, "loss_cls": cls_total, "loss_dice": dice_total}
+    return {"f1_score": score_, "loss_total": total_loss, "loss_cls": cls_total, "loss_dice": dice_total, "loss_img": img_total}
 
     
 
@@ -561,55 +722,117 @@ def mask_path2img_path(mask_path, is_forged):
 
 
 
-def train_one_epoch(model, train_loader, optimizer, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, loss_scaler=None, scaler: Optional[torch.amp.GradScaler] = None) -> dict[str, float]:
+def train_one_epoch(model, train_loader, optimizer, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=1.0, scaler: Optional[torch.amp.GradScaler] = None, log_file=None) -> dict[str, float]:
 
     model.train()
     total_loss = 0
     bce_total = 0
     dice_total = 0
+    is_forged_img_loss = 0
+    activation_module = getattr(model.classification_head[-1], 'activation', None)
 
+    if activation_module is None:
+        is_forged_img_loss_fn = torch.nn.BCEWithLogitsLoss()
+    else:
+        is_forged_img_loss_fn = torch.nn.BCELoss()
+        
     device = str_to_device(device)
     device_type = device.type
 
-    for imgs, masks, path, is_forged in tqdm(train_loader, desc="Training", leave=False):
+    for step, (imgs, masks, path, is_forged) in enumerate(tqdm(train_loader, desc="Training", leave=False)):
 
-        imgs, masks = imgs.to(device, non_blocking=True), masks.to(device, non_blocking=True)
-        if scheduler and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step()
-
+        imgs, masks, is_forged = imgs.to(device, non_blocking=True), masks.to(device, non_blocking=True), is_forged.to(device, non_blocking=True)
+    
+        if not torch.isfinite(imgs).all():
+            print(f"[STEP {step}] imgs NaN")
+            break
+        if not torch.isfinite(masks).all():
+            print(f"[STEP {step}] masks NaN")
+            break
+        if not torch.isfinite(is_forged).all():
+            print(f"[STEP {step}] is_forged NaN")
+            break
         #후에 resize하는 과정도 train할 지 결정
         optimizer.zero_grad()
 
+        # DEBUG
+        for name, param in model.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                print(f"❌ {name} contains NaN/Inf")
+
         with autocast(device_type=device_type, enabled=scaler is not None):
-            outputs = model(imgs)
+            if getattr(model, 'classification_head', None) is not None:
+                outputs, is_forged_logit = model(imgs)
+                outputs = outputs.clamp(min=-5, max=5)
+                # is_forged_logit = is_forged_logit.clamp(min=-20, max=20)
+            else:
+                outputs = model(imgs)
+                
+        if getattr(model, 'classification_head', None) is not None:
+            cls_loss = cls_loss_fn(outputs, masks)
+            dice_loss = dice_loss_fn(outputs.float(), masks.float())
+            img_loss = is_forged_img_loss_fn(is_forged_logit.squeeze(), is_forged.float())
+            loss = alpha * cls_loss*loss_scaler + beta * dice_loss + img_loss*gamma
+        else:
             cls_loss = cls_loss_fn(outputs, masks)
             dice_loss = dice_loss_fn(outputs, masks)
             loss = alpha * cls_loss*loss_scaler + beta * dice_loss
 
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            print(f"[STEP {step}] loss NaN")
+            break
+
+
         if scaler is not None:
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
         if scheduler and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step()
 
+        encoder_norm = torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), max_norm=float("inf"))
+        decoder_norm = torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=float("inf"))
+        cls_head_norm = torch.nn.utils. clip_grad_norm_(model.classification_head.parameters(), max_norm=float("inf")) if getattr(model, 'classification_head', None) is not None else None
+
+        if log_file is not None:
+            log_file.write(
+                f"STEP {step:04d}] "
+                f"Encoder: {encoder_norm:.6f}, Decoder: {decoder_norm:.6f}, ClsHead: {cls_head_norm:.6f} Loss: {loss.item():.6f} CLS Loss: {cls_loss.item():.6f} DICE Loss: {dice_loss.item():.6f} IS FORGED IMG Loss: {img_loss.item():.6f}\n"
+            )
+            log_file.flush()  # 즉시 기록 반영
 
         total_loss += loss.item()
         bce_total += cls_loss.item()
         dice_total += dice_loss.item()
+        is_forged_img_loss += img_loss.item() if getattr(model, 'classification_head', None) is not None else 0
+
+        # DEBUG
+        if torch.isnan(dice_loss):
+            print("⚠️ NaN in dice_loss detected")
+            print("mask finite:", torch.isfinite(masks).all().item(), 
+                "output finite:", torch.isfinite(outputs).all().item())
+            print("mask sum:", masks.sum().item(), "output sum:", outputs.sum().item())
+            print("mask unique:", masks.unique())
+            print("output range:", outputs.min().item(), outputs.max().item())
+            print("output shape:", outputs.shape, "mask shape:", masks.shape)
+            break
 
     return {
         "loss_total": total_loss / len(train_loader),
         "loss_cls": bce_total / len(train_loader),
-        "loss_dice": dice_total / len(train_loader)
+        "loss_dice": dice_total / len(train_loader),
+        "loss_img": is_forged_img_loss / len(train_loader)
     }
 
 
-def predict(model, test_path, device, test_path_file_list=None, img_size=128, max_size=None, interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area=100, low_conf_max_prob = 0.06, low_viz_thr = 0.04, low_conf_min_pixel = 128, scaler: Optional[torch.amp.GradScaler] = None) -> dict[str, str]:
+def predict(model, test_path, device, test_path_file_list=None, img_size=128, max_size=None, interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, low_conf_max_prob = 0.06, low_viz_thr = 0.04, low_conf_min_pixel = 128, scaler: Optional[torch.amp.GradScaler] = None) -> dict[str, str]:
 
     """
     Return RLE string
@@ -641,11 +864,16 @@ def predict(model, test_path, device, test_path_file_list=None, img_size=128, ma
             img_tensor = torch.from_numpy(processed_img)
             img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).contiguous()
             img_tensor = img_tensor.to(device)
+            min_area = int(original_size[0] * original_size[1] * min_area_ratio)
+
 
             with autocast(device_type=device_type, enabled=scaler is not None):
-                logit_map = model(img_tensor)
-                proba_map = torch.sigmoid(logit_map)
-
+                if getattr(model, 'classification_head', None) is not None:
+                    logit_map, _ = model(img_tensor)
+                else:
+                    logit_map = model(img_tensor)
+                
+            proba_map = torch.sigmoid(logit_map)
             proba_map = proba_map.squeeze().cpu().numpy()  # (H, W)
             mask_pred = postprocessing(proba_map, original_size, threshold, low_conf_max_prob, low_viz_thr, low_conf_min_pixel)
             case_id = int(case_id)
