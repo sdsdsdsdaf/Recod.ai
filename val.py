@@ -12,6 +12,11 @@ from time import time
 from transformers import get_cosine_schedule_with_warmup
 from Utils.Model import SMPUnetWithNorm
 from Utils.Loss import FocalTverskyLoss
+from torch.utils.tensorboard import SummaryWriter
+import os
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+import tensorflow as tf
+from datetime import datetime
 
 
 # IMPORTANT: SOME KAGGLE DATA SOURCES ARE PRIVATE
@@ -134,6 +139,7 @@ def cross_val_score(
         scheduler_params=None,
         use_amp=False,
         use_log=False,
+        run_name=None,
         **kwargs,
     ):
 
@@ -141,10 +147,14 @@ def cross_val_score(
         raise ValueError("optimizer must be provided")
     kfold = KFold(n_splits=k, shuffle=True, random_state=random_state)
     log = {}
+    writer = None
 
     for fold, (train_idx, val_idx) in enumerate(kfold.split(dataset)):
-
         print(f"\nFOLD [{fold + 1}/{k}]...")
+        if use_log:
+            log_dir = os.path.join(f"runs/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}", f"FOLD_{fold+1}") if run_name is None else os.path.join(f"runs/{run_name}", f"FOLD_{fold+1}")
+            os.makedirs(log_dir, exist_ok=True)
+            writer = SummaryWriter(log_dir=log_dir)
         fold_start_time = time()
 
         train_ds = Subset(dataset, train_idx)
@@ -183,14 +193,14 @@ def cross_val_score(
             interpolation=interpolation, threshold=threshold,
             min_area_ratio=min_area_ratio, low_conf_max_prob=low_conf_max_prob, 
             low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel,
-            fold=fold+1, use_amp=use_amp, use_log=use_log,
+            fold=fold+1, use_amp=use_amp, use_log=use_log, writer=writer,
             freeze_epoch=freeze_epoch, freeze_layer=freeze_layer, after_freeze_lr=after_freeze_lr
         )
         
         score = evaluate(
             model, val_loader, device, cls_loss, dice_loss, alpha, beta, gamma, loss_scaler,
             interpolation=interpolation, threshold=threshold,
-            min_area=min_area_ratio, low_conf_max_prob=low_conf_max_prob,     
+            min_area_ratio=min_area_ratio, low_conf_max_prob=low_conf_max_prob,     
             low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel
         )
         fold_end_time = time()
@@ -230,29 +240,33 @@ if __name__ == "__main__":
     IMG_SIZE = 256
     BATCH_SIZE = 32
     NUM_EPOCHS = 40
+    NEW_LR_RATIO = None
+    FREEZE_EPOCH = 10
+    FREEZE_LAYER = None
     LR = 1e-3
     # POS_W = torch.tensor(1) # Resized
     MODEL_CLS = SMPUnetWithNorm
-    POS_W = torch.tensor(20) # Original
-    # cls_loss = nn.BCEWithLogitsLoss(weight=POS_W)
+    POS_W = torch.tensor(32) # Original
+    cls_loss = nn.BCEWithLogitsLoss(weight=POS_W)
 
-    
+    """
     cls_loss = FocalLoss(
         mode='binary',
-        alpha=0.7,        # 0.9 → 0.7 : forged 픽셀(양성) 가중치 완화 → FN penalty 약화
-        gamma=1.5,        # 2.0 → 1.5 : overly hard focusing 완화 → 확률 분포 부드럽게
+        alpha=0.8,        # 0.9 → 0.7 : forged 픽셀(양성) 가중치 완화 → FN penalty 약화
+        gamma=2.0,        # 2.0 → 1.5 : overly hard focusing 완화 → 확률 분포 부드럽게
         ignore_index=None,
         normalized=False,
         reduction='mean'
     )
+    """
     
     
 
     # 2️⃣ FN penalty 완화된 FocalTverskyLoss (mask overlap 중심)
     dice_loss = FocalTverskyLoss(
         mode="binary",
-        alpha=0.4,        # 0.3 → 0.4 : FP penalty 강화 → forged mask를 더 타이트하게
-        beta=0.7,         # 0.8 → 0.7 : FN penalty 완화 → forged 영역 덜 탐색
+        alpha=0.35,        # 0.3 → 0.4 : FP penalty 강화 → forged mask를 더 타이트하게
+        beta=0.8,         # 0.8 → 0.7 : FN penalty 완화 → forged 영역 덜 탐색
         gamma=0.85,       # 0.9 → 0.85 : focusing 완화 → 안정성 증가
         log_loss=False,
         from_logits=True,
@@ -269,10 +283,10 @@ if __name__ == "__main__":
     )
     """
 
-    alpha = 0.6  # Weight for combining BCE and Dice losses
+    alpha = 0.4  # Weight for combining BCE and Dice losses
     beta = 1 - alpha
-    gamma = 0.1
-    loss_scaler = 8
+    gamma = 0.5
+    loss_scaler = 0.1
     optimizer_cls = torch.optim.AdamW
 
     scheduler_cls = get_cosine_schedule_with_warmup
@@ -280,17 +294,15 @@ if __name__ == "__main__":
         "num_warmup_steps": None,   # 아래에서 계산됨
         "num_training_steps": None, # 아래에서 계산됨
     }
-    NEW_LR_RATIO = None
-    FREEZE_EPOCH = 15
-    FREEZE_LAYER = None
+
 
 
     #Post Processing HyperParams
-    THRESHOLD = 0.5
+    THRESHOLD = 0.3
     LOW_CONF_MAX_PROB = 0.06
     LOW_VIZ_THR = 0.04
     LOW_CONF_MIN_PIXEL = 128
-    MIN_AREA_RATIO = 0.002
+    MIN_AREA_RATIO = 0.001
     THRESHOLD = 0.5
     TRAIN_SAMPLE_NUM = None
     TEST_SAMPLE_NUM = None
@@ -302,7 +314,7 @@ if __name__ == "__main__":
     USE_AMP = True
 
     #ACK
-    USE_LOG = False
+    USE_LOG = True
 
 
     print_hyperparams()

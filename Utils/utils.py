@@ -19,6 +19,10 @@ from torch.amp import autocast, GradScaler
 from datetime import timedelta
 import gc
 from pytorch_toolbelt import losses as L
+from torch.utils import tensorboard
+from torch.utils.tensorboard import SummaryWriter
+import torchvision
+import torch
 
 class ParticipantVisibleError(Exception):
     pass
@@ -465,6 +469,7 @@ def train(
         interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.02,
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, # PostProcessing Setting,
         fold=None, use_amp=False, use_log=False, freeze_epoch=15, freeze_layer=None, after_freeze_lr=None,
+        writer: Optional[SummaryWriter] =None
     ):
 
     train_loss_log_dict = defaultdict(list)
@@ -484,16 +489,17 @@ def train(
     # DEBUG
     print("Scaler is Not None in def Train: ", scaler is not None)
     
-    if use_log:
-        log_file = open("grad_norm_log.txt", "w")
 
     for E in range(1, epoch + 1):
         epoch_start_time = time()
         if freeze_epoch is not None and E == freeze_epoch:
             optimizer = freeze_encoder_after_epoch(model, E, freeze_at=freeze_epoch, optimizer=optimizer, n_layers=freeze_layer, new_lr_ratio=after_freeze_lr)
+            scheduler.optimizer = optimizer
+
         losses = train_one_epoch(
             model=model, 
-            train_loader=train_loader, 
+            train_loader=train_loader,
+            epoch=E, 
             optimizer=optimizer, 
             device=device, 
             cls_loss_fn=cls_loss_fn, 
@@ -504,7 +510,8 @@ def train(
             gamma=gamma, 
             loss_scaler=loss_scaler, 
             scaler=scaler,
-            log_file=log_file,
+            log_file=None,
+            writer=writer
         )
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"[{E}/{epoch}] CLS LOSS: {losses['loss_cls']:.4f} DICE LOSS: {losses['loss_dice']:.4f} IS FORGED IMG LOSS: {losses['loss_img']:.4f} \nSCALING CLS LOSS: {alpha*loss_scaler*losses['loss_cls']:.4f} SCALING DICE LOSS: {beta*losses['loss_dice']:.4f} SCALING IS FORGED IMG LOSS: {gamma*losses['loss_img']:.4f} TRAIN TOTAL LOSS: {losses['loss_total']:.4f} CURRENT LR: {current_lr:.7f}")
@@ -529,7 +536,9 @@ def train(
             low_conf_max_prob=low_conf_max_prob, 
             low_viz_thr=low_viz_thr, 
             low_conf_min_pixel=low_conf_min_pixel, 
-            scaler=scaler)
+            scaler=scaler
+        )
+        
         print(f"[{E}/{epoch}] VAL F1: {metric_score['f1_score']:.4f}"
               f" TRAIN TOTAL LOSS: {metric_score['loss_total']:.4f}"
               f" CLS LOSS: {metric_score['loss_cls']:.4f} "
@@ -539,35 +548,118 @@ def train(
               f" SCALING DICE LOSS: {beta * metric_score['loss_dice']:.4f} "
               f" SCALING IS FORGED IMG LOSS: {gamma * metric_score['loss_img']:.4f} "
             )
-        for k, v in metric_score.items():
-            val_loss_log_dict[k].append(v)
-        if scheduler and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(metric_score['f1_score'])
-
-        f1_log_list.append(metric_score['f1_score'])
-        if metric_score['f1_score'] > best1_f1:
-            print(f"🏆 Best1 F1: {metric_score['f1_score']:.4f} before {best1_f1:.4f}")
-            best1_f1 = metric_score['f1_score']
         
-        if metric_score['f1_score'] > min(best5_f1):
-            best5_f1.remove(min(best5_f1))
-            best5_f1.append(metric_score['f1_score'])
-            sorted_best = sorted(best5_f1, reverse=True)
-            rank = sorted_best.index(metric_score['f1_score']) + 1
+    
+        if writer is not None:
+            # --- Train losses ---
+            writer.add_scalar("Train/Loss_CLS", losses["loss_cls"], E)
+            writer.add_scalar("Train/Loss_DICE", losses["loss_dice"], E)
+            writer.add_scalar("Train/Loss_IMG", losses["loss_img"], E)
+            writer.add_scalar("Train/Loss_TOTAL", losses["loss_total"], E)
 
-            if fold is not None:
-                save_path = os.path.join("Weights", f"FOLD{fold}", f"best{rank}.pth")
-            else:
-                save_path = os.path.join("Weights", f"best{rank}.pth")
+            # --- Validation losses ---
+            writer.add_scalar("Val/Loss_CLS", metric_score["loss_cls"], E)
+            writer.add_scalar("Val/Loss_DICE", metric_score["loss_dice"], E)
+            writer.add_scalar("Val/Loss_IMG", metric_score["loss_img"], E)
+            writer.add_scalar("Val/Loss_TOTAL", metric_score["loss_total"], E)
+
+            # --- Validation F1 ---
+            writer.add_scalar("Val/F1_Score", metric_score["f1_score"], E)
+
+
+        # ======= 📸 TENSORBOARD IMAGE LOGGING =======
+        if writer is not None and (E % 5 == 1 or E == epoch):
+            model.eval()
+            with torch.no_grad():
+                zero_imgs_list, zero_masks_list = [], []
+                nonzero_imgs_list, nonzero_masks_list = [], []
+
+                # ── ① Validation 전체 순회하며 샘플 선택 ──
+                for imgs, masks, _, _ in val_loader:
+                    # 각 샘플별로 GT 존재 여부 계산
+                    gt_sums = masks.view(masks.shape[0], -1).sum(dim=1)
+
+                    # GT=0인 샘플과 GT>0인 샘플 분리
+                    for i in range(len(gt_sums)):
+                        if gt_sums[i] == 0 and len(zero_imgs_list) < 2:
+                            zero_imgs_list.append(imgs[i])
+                            zero_masks_list.append(masks[i])
+                        elif gt_sums[i] > 0 and len(nonzero_imgs_list) < 2:
+                            nonzero_imgs_list.append(imgs[i])
+                            nonzero_masks_list.append(masks[i])
+
+                        # 둘 다 2개씩 모이면 끝
+                        if len(zero_imgs_list) >= 2 and len(nonzero_imgs_list) >= 2:
+                            break
+                    if len(zero_imgs_list) >= 2 and len(nonzero_imgs_list) >= 2:
+                        break
+
+                # ── ② 선택된 샘플 합치기 ──
+                if len(zero_imgs_list) == 0 or len(nonzero_imgs_list) == 0:
+                    print("⚠️ 샘플을 충분히 찾지 못했습니다.")
+                    return
+
+                imgs = torch.stack(zero_imgs_list + nonzero_imgs_list).to(device)
+                masks = torch.stack(zero_masks_list + nonzero_masks_list).to(device)
+
+                # ── ③ 모델 예측 ──
+                preds, _ = model(imgs)
+                preds = torch.sigmoid(preds)
+                preds_thr = (preds > threshold).float()
+
+                # ── ④ Normalize ──
+                imgs = (imgs - imgs.min()) / (imgs.max() - imgs.min() + 1e-8)
+                masks = (masks - masks.min()) / (masks.max() - masks.min() + 1e-8)
+                preds = (preds - preds.min()) / (preds.max() - preds.min() + 1e-8)
+
+                # ── ⑤ RGB 변환 ──
+                gt_rgb = masks.repeat(1, 3, 1, 1)
+                pred_rgb = preds.repeat(1, 3, 1, 1)
+                pred_thr_rgb = preds_thr.repeat(1, 3, 1, 1)
+
+                # ── ⑥ 행(row)별 시각화 구성 ──
+                rows = []
+                for i in range(imgs.shape[0]):  # 총 4개 샘플
+                    row = torch.cat([imgs[i], gt_rgb[i], pred_rgb[i], pred_thr_rgb[i]], dim=2)
+                    rows.append(row)
+
+                # ── ⑦ 세로로 합치기 (4행 × 4열 구조 완성) ──
+                grid = torch.cat(rows, dim=1)  # height 방향으로 stack
+                grid = grid.clamp(0, 1).to(torch.float32)
+
+                # ── ⑧ TensorBoard에 기록 ──
+                writer.add_image(f"Samples/FOLD{fold}/epoch_{E}", grid, E)
+
+                
+            for k, v in metric_score.items():
+                val_loss_log_dict[k].append(v)
+            if scheduler and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(metric_score['f1_score'])
+
+            f1_log_list.append(metric_score['f1_score'])
+            if metric_score['f1_score'] > best1_f1:
+                print(f"🏆 Best1 F1: {metric_score['f1_score']:.4f} before {best1_f1:.4f}")
+                best1_f1 = metric_score['f1_score']
             
-            try:
-                torch.save(model.state_dict(), save_path)
-                print(f"🔥 F1 {metric_score['f1_score']:.4f} entered Top5 → Rank {rank}/5")
-                print(f"💾 Saved checkpoint: {save_path}")
-            except Exception as e:
-                print(f"⚠️ Failed to save model at {save_path}: {e}")
-        epoch_end_time = time()
-        print(f"[EPOCH {E}/{epoch}] TIME : {timedelta(seconds=epoch_end_time - epoch_start_time)}")
+            if metric_score['f1_score'] > min(best5_f1):
+                best5_f1.remove(min(best5_f1))
+                best5_f1.append(metric_score['f1_score'])
+                sorted_best = sorted(best5_f1, reverse=True)
+                rank = sorted_best.index(metric_score['f1_score']) + 1
+
+                if fold is not None:
+                    save_path = os.path.join("Weights", f"FOLD{fold}", f"best{rank}.pth")
+                else:
+                    save_path = os.path.join("Weights", f"best{rank}.pth")
+                
+                try:
+                    torch.save(model.state_dict(), save_path)
+                    print(f"🔥 F1 {metric_score['f1_score']:.4f} entered Top5 → Rank {rank}/5")
+                    print(f"💾 Saved checkpoint: {save_path}")
+                except Exception as e:
+                    print(f"⚠️ Failed to save model at {save_path}: {e}")
+            epoch_end_time = time()
+            print(f"[EPOCH {E}/{epoch}] TIME : {timedelta(seconds=epoch_end_time - epoch_start_time)}")
 
         torch.cuda.synchronize()
         gc.collect()
@@ -577,9 +669,7 @@ def train(
             torch.cuda.memory._free_cached_blocks()  # PyTorch 2.6에서 동작
         except Exception:
             pass
-    
-    if use_log:
-        log_file.close()
+ 
     return {'train_loss': train_loss_log_dict, 'val_loss': val_loss_log_dict, 'f1_score': f1_log_list}
 
 
@@ -617,6 +707,10 @@ def evaluate(
 
         if getattr(model, 'classification_head', None) is not None:
             is_forged_logit, is_forged = is_forged_logit.float(), is_forged.float()
+
+            is_forged_logit = torch.atleast_1d(is_forged_logit)
+            is_forged = torch.atleast_1d(is_forged)
+
             cls_loss = cls_loss_fn(logit_map, masks)
             dice_loss = dice_loss_fn(logit_map, masks)
             img_loss = is_forged_img_loss_fn(is_forged_logit, is_forged)
@@ -722,7 +816,7 @@ def mask_path2img_path(mask_path, is_forged):
 
 
 
-def train_one_epoch(model, train_loader, optimizer, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=1.0, scaler: Optional[torch.amp.GradScaler] = None, log_file=None) -> dict[str, float]:
+def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=1.0, scaler: Optional[torch.amp.GradScaler] = None, log_file=None, writer:SummaryWriter=None) -> dict[str, float]:
 
     model.train()
     total_loss = 0
@@ -763,15 +857,23 @@ def train_one_epoch(model, train_loader, optimizer, device:Union[torch.device,st
         with autocast(device_type=device_type, enabled=scaler is not None):
             if getattr(model, 'classification_head', None) is not None:
                 outputs, is_forged_logit = model(imgs)
-                outputs = outputs.clamp(min=-5, max=5)
+                if not torch.isfinite(outputs).all():
+                    print("[NaN DETECTED] step=", step, " paths=", path)
+                outputs = torch.nan_to_num(outputs, nan=0.0, neginf=-4.8, posinf=4.8)
+                outputs = outputs.clamp(min=-4.8, max=4.8)
                 # is_forged_logit = is_forged_logit.clamp(min=-20, max=20)
             else:
                 outputs = model(imgs)
                 
         if getattr(model, 'classification_head', None) is not None:
             cls_loss = cls_loss_fn(outputs, masks)
-            dice_loss = dice_loss_fn(outputs.float(), masks.float())
-            img_loss = is_forged_img_loss_fn(is_forged_logit.squeeze(), is_forged.float())
+            
+            with autocast(device_type=device_type, enabled=False):
+                dice_loss = dice_loss_fn(outputs.float(), masks.float())
+                img_loss = is_forged_img_loss_fn(is_forged_logit.squeeze(), is_forged.float())
+                if torch.isnan(dice_loss):
+                    print(f"[NaN DETECTED] Skipping backward at step {step}")
+                    dice_loss = torch.nan_to_num(loss=dice_loss, nan=0.0, posinf=1.0, neginf=0.0)
             loss = alpha * cls_loss*loss_scaler + beta * dice_loss + img_loss*gamma
         else:
             cls_loss = cls_loss_fn(outputs, masks)
@@ -786,12 +888,12 @@ def train_one_epoch(model, train_loader, optimizer, device:Union[torch.device,st
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
             optimizer.step()
 
         if scheduler and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -800,18 +902,25 @@ def train_one_epoch(model, train_loader, optimizer, device:Union[torch.device,st
         encoder_norm = torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), max_norm=float("inf"))
         decoder_norm = torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=float("inf"))
         cls_head_norm = torch.nn.utils. clip_grad_norm_(model.classification_head.parameters(), max_norm=float("inf")) if getattr(model, 'classification_head', None) is not None else None
+        global_step = (epoch-1) * len(train_loader) + step
 
-        if log_file is not None:
-            log_file.write(
-                f"STEP {step:04d}] "
-                f"Encoder: {encoder_norm:.6f}, Decoder: {decoder_norm:.6f}, ClsHead: {cls_head_norm:.6f} Loss: {loss.item():.6f} CLS Loss: {cls_loss.item():.6f} DICE Loss: {dice_loss.item():.6f} IS FORGED IMG Loss: {img_loss.item():.6f}\n"
-            )
-            log_file.flush()  # 즉시 기록 반영
+        if writer is not None:
+            writer.add_scalar("Loss/Train_step", loss.item(), global_step)
+            writer.add_scalar("Loss/Cls_step", cls_loss.item(), global_step)
+            writer.add_scalar("Loss/Dice_step", dice_loss.item(), global_step)
+            writer.add_scalar("Loss/Img_step", img_loss.item(), global_step)   
+            writer.add_scalar("Loss/Total_step", loss.item(), global_step) 
+            writer.add_scalar("Norm/Encoder", encoder_norm, global_step)
+            writer.add_scalar("Norm/Decoder", decoder_norm, global_step)
+            writer.add_scalar("Norm/Cls_head", cls_head_norm, global_step)
+            writer.add_scalar("LR", optimizer.param_groups[0]["lr"], global_step)
+            
 
         total_loss += loss.item()
         bce_total += cls_loss.item()
         dice_total += dice_loss.item()
         is_forged_img_loss += img_loss.item() if getattr(model, 'classification_head', None) is not None else 0
+
 
         # DEBUG
         if torch.isnan(dice_loss):
@@ -823,6 +932,7 @@ def train_one_epoch(model, train_loader, optimizer, device:Union[torch.device,st
             print("output range:", outputs.min().item(), outputs.max().item())
             print("output shape:", outputs.shape, "mask shape:", masks.shape)
             break
+
 
     return {
         "loss_total": total_loss / len(train_loader),
