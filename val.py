@@ -140,6 +140,9 @@ def cross_val_score(
         use_amp=False,
         use_log=False,
         run_name=None,
+        new_alpha=0.2,
+        new_beta=0.8,
+        new_gamma=0.0,
         **kwargs,
     ):
 
@@ -164,7 +167,7 @@ def cross_val_score(
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=ues_pin_memory)
 
         #후에 제거
-        torch.autograd.set_detect_anomaly(True)
+        # torch.autograd.set_detect_anomaly(True)
 
         total_steps = len(train_loader) * epoch
         scheduler_params["num_warmup_steps"] = int(total_steps * 0.1)
@@ -194,7 +197,8 @@ def cross_val_score(
             min_area_ratio=min_area_ratio, low_conf_max_prob=low_conf_max_prob, 
             low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel,
             fold=fold+1, use_amp=use_amp, use_log=use_log, writer=writer,
-            freeze_epoch=freeze_epoch, freeze_layer=freeze_layer, after_freeze_lr=after_freeze_lr
+            freeze_epoch=freeze_epoch, freeze_layer=freeze_layer, after_freeze_lr=after_freeze_lr,
+            new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma,
         )
         
         score = evaluate(
@@ -270,7 +274,7 @@ if __name__ == "__main__":
         gamma=0.85,       # 0.9 → 0.85 : focusing 완화 → 안정성 증가
         log_loss=False,
         from_logits=True,
-        smooth=1e-7,
+        smooth=1e-5
     )
     """
     dice_loss = smp.losses.TverskyLoss(
@@ -287,6 +291,9 @@ if __name__ == "__main__":
     beta = 1 - alpha
     gamma = 0.5
     loss_scaler = 0.1
+    new_alpha = 0.2
+    new_beta = 1 - new_alpha
+    new_gamma = 0.0
     optimizer_cls = torch.optim.AdamW
 
     scheduler_cls = get_cosine_schedule_with_warmup

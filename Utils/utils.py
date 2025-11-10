@@ -21,7 +21,7 @@ import gc
 from pytorch_toolbelt import losses as L
 from torch.utils import tensorboard
 from torch.utils.tensorboard import SummaryWriter
-import torchvision
+from PIL import Image, ImageDraw, ImageFont
 import torch
 
 class ParticipantVisibleError(Exception):
@@ -469,7 +469,7 @@ def train(
         interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.02,
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, # PostProcessing Setting,
         fold=None, use_amp=False, use_log=False, freeze_epoch=15, freeze_layer=None, after_freeze_lr=None,
-        writer: Optional[SummaryWriter] =None
+        writer: Optional[SummaryWriter] =None, new_alpha=0.2, new_beta=0.8, new_gamma=0.0,
     ):
 
     train_loss_log_dict = defaultdict(list)
@@ -492,9 +492,11 @@ def train(
 
     for E in range(1, epoch + 1):
         epoch_start_time = time()
-        if freeze_epoch is not None and E == freeze_epoch:
+        if freeze_epoch is not None and E == (freeze_epoch + 1):
             optimizer = freeze_encoder_after_epoch(model, E, freeze_at=freeze_epoch, optimizer=optimizer, n_layers=freeze_layer, new_lr_ratio=after_freeze_lr)
             scheduler.optimizer = optimizer
+            alpha, beta, gamma = new_alpha, new_beta, new_gamma
+
 
         losses = train_one_epoch(
             model=model, 
@@ -627,8 +629,44 @@ def train(
                 grid = torch.cat(rows, dim=1)  # height 방향으로 stack
                 grid = grid.clamp(0, 1).to(torch.float32)
 
-                # ── ⑧ TensorBoard에 기록 ──
-                writer.add_image(f"Samples/FOLD{fold}/epoch_{E}", grid, E)
+                grid_np = (grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                grid_pil = Image.fromarray(grid_np)
+
+                # ── 🖋️ 폰트 설정
+                try:
+                    font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 20)
+                except:
+                    font = ImageFont.load_default()
+
+                draw = ImageDraw.Draw(grid_pil)
+                H, W = grid_pil.size[1], grid_pil.size[0]
+                col_width = W // 4  # 4열
+
+                # ── 열 이름 정의
+                col_labels = ["Input", "GT", "Proba", "Binary"]
+
+                # ── 아래쪽에 여백 추가 (텍스트 공간 확보)
+                label_height = 40
+                new_img = Image.new("RGB", (W, H + label_height), color=(0, 0, 0))
+                new_img.paste(grid_pil, (0, 0))
+
+                # ── 텍스트 그리기 (열별 중앙정렬)
+                draw = ImageDraw.Draw(new_img)
+                for i, label in enumerate(col_labels):
+                    try:
+                        bbox = draw.textbbox((0, 0), label, font=font)
+                        text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                    except AttributeError:
+                        text_w, text_h = draw.textsize(label, font=font)
+                    x = int((i + 0.5) * col_width - text_w / 2)
+                    y = H + (label_height - text_h) // 2
+                    draw.text((x, y), label, fill=(255, 255, 0), font=font)
+
+                # ── torch 텐서로 다시 변환
+                grid_labeled = torch.from_numpy(np.array(new_img)).permute(2, 0, 1).float() / 255.0
+
+                # ── TensorBoard 기록
+                writer.add_image(f"Samples/FOLD{fold}/epoch_{E}", grid_labeled, E)
 
                 
             for k, v in metric_score.items():
@@ -857,7 +895,7 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
         with autocast(device_type=device_type, enabled=scaler is not None):
             if getattr(model, 'classification_head', None) is not None:
                 outputs, is_forged_logit = model(imgs)
-                if not torch.isfinite(outputs).all():
+                if torch.isnan(outputs).any() or torch.isinf(outputs).any():
                     print("[NaN DETECTED] step=", step, " paths=", path)
                 outputs = torch.nan_to_num(outputs, nan=0.0, neginf=-4.8, posinf=4.8)
                 outputs = outputs.clamp(min=-4.8, max=4.8)
