@@ -10,9 +10,12 @@ import cv2
 from datetime import timedelta
 from time import time
 from transformers import get_cosine_schedule_with_warmup
+
 from Utils.Model import SMPUnetWithNorm
 from Utils.Loss import FocalTverskyLoss
 from torch.utils.tensorboard import SummaryWriter
+from segmentation_models_pytorch.losses.soft_bce import SoftBCEWithLogitsLoss
+
 import os
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import tensorflow as tf
@@ -79,6 +82,12 @@ def print_hyperparams():
     print(f"Freeze Epoch:       {FREEZE_EPOCH}")
     print(f"Freeze Layer:       {FREEZE_LAYER}")
     print(f"New LR Ratio:       {NEW_LR_RATIO}")
+    print(f"Run Name:           {RUN_NAME}")
+    print(f"New α (cls loss):   {new_alpha}")
+    print(f"New β (dice loss):  {new_beta}")
+    print(f"New γ (img loss):   {new_gamma}")
+    print(f"Pos W Ratio:        {POS_W_RATIO}")
+    print(f"POS_W:              {POS_W}")
 
 
     # === LOSS FUNCTIONS ===
@@ -203,8 +212,7 @@ def cross_val_score(
         
         score = evaluate(
             model, val_loader, device, cls_loss, dice_loss, alpha, beta, gamma, loss_scaler,
-            interpolation=interpolation, threshold=threshold,
-            min_area_ratio=min_area_ratio, low_conf_max_prob=low_conf_max_prob,     
+            interpolation=interpolation, threshold=threshold,            min_area_ratio=min_area_ratio, low_conf_max_prob=low_conf_max_prob,     
             low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel
         )
         fold_end_time = time()
@@ -240,19 +248,48 @@ if __name__ == "__main__":
     #Interpolation Method
     INTERPOLATION = cv2.INTER_NEAREST
 
+    #Post Processing HyperParams
+    THRESHOLD = 0.3
+    LOW_CONF_MAX_PROB = 0.06
+    LOW_VIZ_THR = 0.04
+    LOW_CONF_MIN_PIXEL = 128
+    MIN_AREA_RATIO = 0.001
+    THRESHOLD = 0.5
+    TRAIN_SAMPLE_NUM = None
+    TEST_SAMPLE_NUM = None
+
+    paths = {
+        'train_authentic': os.path.join(TRAIN_DIR, "authentic"),
+        'train_forged': os.path.join(TRAIN_DIR, "forged"),
+        'train_masks': os.path.join(COMP_DIR, "train_masks"),
+        'test_images': TEST_DIR
+    }
+
+
     #Learning HyperParams
     IMG_SIZE = 256
+    full_ds = HybridDataset(
+        "train_data.h5",
+        paths['train_authentic'],
+        paths['train_forged'],
+        paths['train_masks'],
+        img_size=IMG_SIZE,
+        is_train=True,
+        preload=True,
+        verbose=True
+    )
+
     BATCH_SIZE = 32
     NUM_EPOCHS = 40
-    NEW_LR_RATIO = None
+    NEW_LR_RATIO = 0.1
     FREEZE_EPOCH = 10
     FREEZE_LAYER = None
     LR = 1e-3
     # POS_W = torch.tensor(1) # Resized
     MODEL_CLS = SMPUnetWithNorm
-    POS_W = torch.tensor(32) # Original
-    cls_loss = nn.BCEWithLogitsLoss(weight=POS_W)
-
+    POS_W_RATIO = 0.25
+    POS_W = compute_pos_weight(dataset=full_ds, h5_path="train_data.h5") * POS_W_RATIO
+    cls_loss = SoftBCEWithLogitsLoss(pos_weight=POS_W, smooth_factor=0.02)
     """
     cls_loss = FocalLoss(
         mode='binary',
@@ -287,11 +324,11 @@ if __name__ == "__main__":
     )
     """
 
-    alpha = 0.4  # Weight for combining BCE and Dice losses
+    alpha = 0.7  # Weight for combining BCE and Dice losses
     beta = 1 - alpha
     gamma = 0.5
-    loss_scaler = 0.1
-    new_alpha = 0.2
+    loss_scaler = 1
+    new_alpha = 0.1
     new_beta = 1 - new_alpha
     new_gamma = 0.0
     optimizer_cls = torch.optim.AdamW
@@ -303,18 +340,6 @@ if __name__ == "__main__":
     }
 
 
-
-    #Post Processing HyperParams
-    THRESHOLD = 0.3
-    LOW_CONF_MAX_PROB = 0.06
-    LOW_VIZ_THR = 0.04
-    LOW_CONF_MIN_PIXEL = 128
-    MIN_AREA_RATIO = 0.001
-    THRESHOLD = 0.5
-    TRAIN_SAMPLE_NUM = None
-    TEST_SAMPLE_NUM = None
-
-
     #Aceleration Params -> Default: cpu settings
     USE_PIN_MEM = torch.cuda.is_available() and "Windows" not in platform.platform()
     NUM_WORKERS = 4 if torch.cuda.is_available() and "Windows" not in platform.platform() else 0
@@ -322,29 +347,12 @@ if __name__ == "__main__":
 
     #ACK
     USE_LOG = True
+    RUN_NAME = "smp_bce_loss-alpha=0.7_new_alpha=0.1-loss-scaler=1-POS_W_RATIO=0.25 Optimizer State pruned LR x0.1"
 
 
     print_hyperparams()
 
-    paths = {
-        'train_authentic': os.path.join(TRAIN_DIR, "authentic"),
-        'train_forged': os.path.join(TRAIN_DIR, "forged"),
-        'train_masks': os.path.join(COMP_DIR, "train_masks"),
-        'test_images': TEST_DIR
-    }
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    full_ds = HybridDataset(
-        "train_data.h5",
-        paths['train_authentic'],
-        paths['train_forged'],
-        paths['train_masks'],
-        img_size=IMG_SIZE,
-        is_train=True,
-        preload=True,
-        verbose=True
-    )
-    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")    
     cv_start_time = time()
     train_log = cross_val_score(
         MODEL_CLS, k=5, dataset=full_ds, device=device, batch_size=BATCH_SIZE,
@@ -354,7 +362,8 @@ if __name__ == "__main__":
         threshold=THRESHOLD, min_area_ratio=MIN_AREA_RATIO, low_conf_max_prob=LOW_CONF_MAX_PROB,
         low_viz_thr=LOW_VIZ_THR, low_conf_min_pixel=LOW_CONF_MIN_PIXEL, lr=LR, use_log=USE_LOG,
         optimizer_cls=optimizer_cls, scheduler_cls=get_cosine_schedule_with_warmup, scheduler_params=scheduler_params, use_amp=USE_AMP,
-        freeze_epoch=FREEZE_EPOCH, freeze_layer=FREEZE_LAYER, after_freeze_lr=NEW_LR_RATIO, 
+        freeze_epoch=FREEZE_EPOCH, freeze_layer=FREEZE_LAYER, after_freeze_lr=NEW_LR_RATIO,  run_name=RUN_NAME,
+        new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma,
 
         encoder_name="efficientnet-b3", encoder_weights="imagenet", #모델 파라미터
         in_channels=3, classes=1, activation=None, aux_params={

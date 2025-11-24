@@ -286,6 +286,48 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
     )
     return float(np.mean(df['image_score']))
 
+def rebuild_optimizer_preserve_state(old_optimizer, model, new_lr_ratio=None):
+    """Rebuild optimizer after freezing parts of model while preserving state and group structure."""
+    # Only trainable params
+    new_params = [p for p in model.parameters() if p.requires_grad]
+    ptr_to_new = {p.data_ptr(): p for p in new_params}
+
+    # Same optimizer type & defaults
+    new_optimizer = type(old_optimizer)(model.parameters(), **old_optimizer.defaults)
+
+    # Copy over group-wise structure
+    new_groups = []
+    for old_g in old_optimizer.param_groups:
+        new_g = {k: v for k, v in old_g.items() if k != "params"}
+        new_g["params"] = [
+            ptr_to_new[p.data_ptr()] for p in old_g["params"] if p.data_ptr() in ptr_to_new
+        ]
+        if new_g["params"]:
+            new_groups.append(new_g)
+    new_optimizer.param_groups = new_groups
+
+    # Copy existing states only for still-active params
+    old_state = old_optimizer.state
+    new_state = {}
+    for old_p, st in old_state.items():
+        ptr = old_p.data_ptr()
+        if ptr in ptr_to_new:
+            new_state[ptr_to_new[ptr]] = st
+
+    # Ensure every param in new optimizer has a state entry
+    for group in new_optimizer.param_groups:
+        for p in group["params"]:
+            if p not in new_state:
+                new_state[p] = {}
+
+    new_optimizer.state = new_state
+
+    # Adjust LR if requested (apply per-group)
+    if new_lr_ratio is not None:
+        for g in new_optimizer.param_groups:
+            g["lr"] = g["lr"] * new_lr_ratio
+
+    return new_optimizer
 
 def freeze_encoder_after_epoch(
     model, current_epoch, freeze_at: int, optimizer=None, n_layers: Optional[int] = None, new_lr_ratio: Optional[float] = None,
@@ -327,21 +369,16 @@ def freeze_encoder_after_epoch(
                     param.requires_grad = requires_grad
 
             print(f"➡️ Encoder frozen except for last {n_layers} stage(s).")
-
-        # optimizer 다시 구성 (필요 시)
         if optimizer is not None:
-            defaults = optimizer.defaults.copy()
-            if new_lr_ratio is not None:
-                defaults["lr"] *= new_lr_ratio
-            optimizer 
-            optimizer = type(optimizer)(
-                filter(lambda p: p.requires_grad, model.parameters()),
-                **optimizer.defaults,
-            )
-            print("🧩 Optimizer reinitialized (encoder params removed).")
-        return optimizer
+            print(f"OLd LR: {optimizer.param_groups[1]['lr']}")
+            optimizer = rebuild_optimizer_preserve_state(optimizer, model, new_lr_ratio)
+            print("🧩 Optimizer updated (state pruned).")
+            print(f"Optimzer new LR: {optimizer.param_groups[1]['lr']}")   
 
     return optimizer
+
+
+
 
 
 
@@ -492,7 +529,7 @@ def train(
 
     for E in range(1, epoch + 1):
         epoch_start_time = time()
-        if freeze_epoch is not None and E == (freeze_epoch + 1):
+        if freeze_epoch is not None and E == freeze_epoch:
             optimizer = freeze_encoder_after_epoch(model, E, freeze_at=freeze_epoch, optimizer=optimizer, n_layers=freeze_layer, new_lr_ratio=after_freeze_lr)
             scheduler.optimizer = optimizer
             alpha, beta, gamma = new_alpha, new_beta, new_gamma
@@ -898,7 +935,7 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
                 if torch.isnan(outputs).any() or torch.isinf(outputs).any():
                     print("[NaN DETECTED] step=", step, " paths=", path)
                 outputs = torch.nan_to_num(outputs, nan=0.0, neginf=-4.8, posinf=4.8)
-                outputs = outputs.clamp(min=-4.8, max=4.8)
+                outputs = outputs / (outputs.abs() / 4.8 + 1)
                 # is_forged_logit = is_forged_logit.clamp(min=-20, max=20)
             else:
                 outputs = model(imgs)
@@ -951,8 +988,8 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
             writer.add_scalar("Norm/Encoder", encoder_norm, global_step)
             writer.add_scalar("Norm/Decoder", decoder_norm, global_step)
             writer.add_scalar("Norm/Cls_head", cls_head_norm, global_step)
-            writer.add_scalar("LR", optimizer.param_groups[0]["lr"], global_step)
-            
+            writer.add_scalar("LR/encoder", optimizer.param_groups[0]["lr"], global_step)
+            writer.add_scalar("LR/decoder", optimizer.param_groups[1]["lr"], global_step)
 
         total_loss += loss.item()
         bce_total += cls_loss.item()
