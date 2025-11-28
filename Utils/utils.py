@@ -665,7 +665,12 @@ def train(
                 masks = torch.stack(zero_masks_list + nonzero_masks_list).to(device)
 
                 # ── ③ 모델 예측 ──
-                preds, _ = model(imgs)
+                if hasattr(model, 'classification_head'):
+                    preds, _ = model(imgs)
+                else:   
+                    preds = model(imgs)
+
+                # ── ④ Threshold 적용 ──
                 preds = torch.sigmoid(preds)
                 preds_thr = (preds > threshold).float()
 
@@ -800,6 +805,7 @@ def evaluate(
 
             else:
                 logit_map = model(imgs)
+                logit_map = logit_map.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
 
         logit_map, masks = logit_map.float(), masks.float()
 

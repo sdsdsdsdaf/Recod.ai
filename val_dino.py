@@ -333,7 +333,7 @@ if __name__ == "__main__":
         gamma=0.85,       # 0.9 → 0.85 : focusing 완화 → 안정성 증가
         log_loss=True,
         from_logits=True,
-        smooth=1e-3
+        smooth=1e-5
     )
     """
     dice_loss = smp.losses.TverskyLoss(
