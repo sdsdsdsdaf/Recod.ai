@@ -14,7 +14,7 @@ from datetime import timedelta
 from time import time
 from transformers import get_cosine_schedule_with_warmup
 
-from Utils.Model import SMPUnetWithNorm, SMPDeepLabV3PlusWithNorm
+from Utils.Model import SimpleDINOv2
 from Utils.Loss import FocalTverskyLoss
 from torch.utils.tensorboard import SummaryWriter
 from segmentation_models_pytorch.losses.soft_bce import SoftBCEWithLogitsLoss
@@ -184,15 +184,38 @@ def cross_val_score(
         model = model_cls(**kwargs)
         
         #TODO 후에 하드코딩아닌 함수인자로 받기
-        try:
-            optimizer = optimizer_cls([
-                {"params": model.encoder.parameters(), "lr": lr*0.5},   # 천천히 미세조정
-                {"params": model.decoder.parameters(), "lr": lr},   # 크게 학습
-                {"params": model.segmentation_head.parameters(), "lr": lr},  # 크게 학습
-                {"params": model.classification_head.parameters(), "lr": lr}
-            ], weight_decay=1e-3)
-        except:
-            optimizer = optimizer_cls(model.parameters(), lr=lr, weight_decay=1e-3)
+# --- [모델 & 최적화 준비] ---
+# ... (model, optimizer_cls, lr 정의는 그대로) ...
+
+# 💡 모델 구조에 따라 파라미터 그룹 동적 설정
+        if hasattr(model, 'encoder'):
+            # A. SMP (Unet/DeepLab) 구조일 때
+            params_group = [
+                {"params": model.encoder.parameters(), "lr": lr*0.5},
+                {"params": model.decoder.parameters(), "lr": lr},
+                # segmentation_head와 classification_head는 없을 수도 있지만,
+                # 에러를 피하기 위해 try/except 대신 if/else로 처리
+            ]
+            if hasattr(model, 'segmentation_head'):
+                params_group.append({"params": model.segmentation_head.parameters(), "lr": lr})
+            if hasattr(model, 'classification_head'):
+                params_group.append({"params": model.classification_head.parameters(), "lr": lr})
+
+        elif hasattr(model, 'backbone') and hasattr(model, 'decoder_low'):
+            # B. DINOv2 (ViT) 기반 커스텀 구조일 때 (사용자님의 현재 모델)
+            decoder_params = list(model.decoder_low.parameters()) + list(model.decoder_high.parameters())
+            params_group = [
+                {"params": model.backbone.parameters(), "lr": lr * 0.1}, # ViT는 훨씬 느리게 학습 (0.1)
+                {"params": decoder_params, "lr": lr},                    # 디코더는 빠르게 학습
+            ]
+
+        else:
+            # C. 기타 구조이거나 파라미터 그룹 분리가 불필요할 때
+            params_group = model.parameters()
+
+
+        # 최종 Optimizer 정의
+        optimizer = optimizer_cls(params_group, weight_decay=1e-3)  
 
         scheduler = scheduler_cls(optimizer, **scheduler_params) if scheduler_cls else None
         if scheduler_cls is not None: scheduler.last_epoch = -1; scheduler.step()
@@ -266,9 +289,9 @@ if __name__ == "__main__":
 
 
     #Learning HyperParams
-    IMG_SIZE = 256
+    IMG_SIZE = 224
     full_ds = HybridDataset(
-        "train_data.h5",
+        "train_data_dino.h5",
         paths['train_authentic'],
         paths['train_forged'],
         paths['train_masks'],
@@ -285,9 +308,9 @@ if __name__ == "__main__":
     FREEZE_LAYER = None
     LR = 1e-3
     # POS_W = torch.tensor(1) # Resized
-    MODEL_CLS = SMPDeepLabV3PlusWithNorm
+    MODEL_CLS = SimpleDINOv2
     POS_W_RATIO = 0.25
-    POS_W = compute_pos_weight(dataset=full_ds, h5_path="train_data.h5") * POS_W_RATIO
+    POS_W = compute_pos_weight(dataset=full_ds, h5_path="train_data_dino.h5") * POS_W_RATIO
     cls_loss = SoftBCEWithLogitsLoss(pos_weight=POS_W, smooth_factor=0.02)
     """
     cls_loss = FocalLoss(
@@ -308,9 +331,9 @@ if __name__ == "__main__":
         alpha=0.35,        # 0.3 → 0.4 : FP penalty 강화 → forged mask를 더 타이트하게
         beta=0.8,         # 0.8 → 0.7 : FN penalty 완화 → forged 영역 덜 탐색
         gamma=0.85,       # 0.9 → 0.85 : focusing 완화 → 안정성 증가
-        log_loss=False,
+        log_loss=True,
         from_logits=True,
-        smooth=1e-5
+        smooth=1e-3
     )
     """
     dice_loss = smp.losses.TverskyLoss(
@@ -342,11 +365,11 @@ if __name__ == "__main__":
     #Aceleration Params -> Default: cpu settings
     USE_PIN_MEM = torch.cuda.is_available() and "Windows" not in platform.platform()
     NUM_WORKERS = 4 if torch.cuda.is_available() and "Windows" not in platform.platform() else 0
-    USE_AMP = True
+    USE_AMP = False
 
     #ACK
     USE_LOG = True
-    RUN_NAME = "smp_deepLabV3+_bce_loss-alpha=0.7_new_alpha=0.1-loss-scaler=1-POS_W_RATIO=0.25 Optimizer State pruned LR x0.1"
+    RUN_NAME = "DINO_V2_bce_loss-alpha=0.7_new_alpha=0.1-loss-scaler=1-POS_W_RATIO=0.25 Optimizer State pruned LR x0.1"
 
 
     print_hyperparams()

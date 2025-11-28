@@ -19,8 +19,14 @@ from torch.amp import autocast, GradScaler
 from datetime import timedelta
 import gc
 from pytorch_toolbelt import losses as L
-from torch.utils import tensorboard
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    try:
+        from tensorboard import SummaryWriter
+    except ImportError:
+        SummaryWriter = None
+        print("Warning: tensorboard not available. Logging will be disabled.")
 from PIL import Image, ImageDraw, ImageFont
 import torch
 
@@ -329,51 +335,68 @@ def rebuild_optimizer_preserve_state(old_optimizer, model, new_lr_ratio=None):
 
     return new_optimizer
 
+from typing import Optional
+
 def freeze_encoder_after_epoch(
     model, current_epoch, freeze_at: int, optimizer=None, n_layers: Optional[int] = None, new_lr_ratio: Optional[float] = None,
 ):
     """
-    Freeze encoder parameters after a given epoch.
-    Optionally keep the last N stages (layers) unfrozen.
-
-    Args:
-        model (torch.nn.Module): smp.Unet model instance
-        current_epoch (int): current epoch index
-        freeze_at (int): epoch index to start freezing
-        optimizer (torch.optim.Optimizer, optional): optimizer to rebuild after freezing
-        n_layers (int, optional): number of last encoder stages to keep trainable.
-                                 Default=None → freeze entire encoder.
+    Freeze encoder (CNN) 또는 backbone (ViT) 파라미터를 동적으로 처리합니다.
+    (함수 이름은 기존과 동일하게 유지합니다.)
     """
-    if current_epoch == freeze_at:
-        print(f"🔒 Freezing encoder at epoch {freeze_at}...")
+    if current_epoch != freeze_at:
+        return optimizer
 
-        # encoder 내부 stage 목록 가져오기
+    # --- 1. Encoder/Backbone 모듈 이름 결정 및 객체 가져오기 ---
+    encoder_name = None
+    if hasattr(model, 'encoder'):
+        encoder_name = 'encoder'
+    elif hasattr(model, 'backbone'):
+        encoder_name = 'backbone'
+    
+    if not encoder_name:
+        print("Skipping freeze: 'encoder' 또는 'backbone' 속성을 찾을 수 없어 파라미터 제어를 건너뜁니다.")
+        return optimizer
+
+    encoder_module = getattr(model, encoder_name) 
+    print(f"🔒 Freezing {encoder_name} at epoch {freeze_at}...")
+
+    # --- 2. 스테이지/블록 목록 가져오기 ---
+    if encoder_name == 'backbone' and hasattr(encoder_module, 'blocks'):
+        # DINOv2 (ViT) 구조: 'blocks' (Transformer Block 리스트) 사용
+        stages = encoder_module.blocks 
+    else:
+        # CNN (SMP) 구조: get_stages()를 시도하거나 children() 사용
         try:
-            stages = model.encoder.get_stages()
+            stages = encoder_module.get_stages()
         except AttributeError:
-            # 일부 encoder는 get_stages() 대신 _blocks, features 등 이름 다름
-            stages = list(model.encoder.children())
+            stages = list(encoder_module.children())
 
-        if n_layers is None or n_layers <= 0:
-            # 전체 encoder freeze
-            for param in model.encoder.parameters():
-                param.requires_grad = False
-            print("➡️ Entire encoder frozen.")
-        else:
-            # 마지막 n_layers만 제외하고 freeze
-            num_stages = len(stages)
-            freeze_until = max(0, num_stages - n_layers)
-            for i, stage in enumerate(stages):
-                requires_grad = (i >= freeze_until)  # 뒤쪽 n_layers만 학습
-                for param in stage.parameters():
-                    param.requires_grad = requires_grad
+    # --- 3. Freeze 로직 적용 (이하 원본 로직과 동일) ---
+    if n_layers is None or n_layers <= 0:
+        # 전체 freeze
+        for param in encoder_module.parameters():
+            param.requires_grad = False
+        print(f"➡️ Entire {encoder_name} frozen.")
+    else:
+        # 마지막 n_layers만 제외하고 freeze
+        num_stages = len(stages)
+        freeze_until = max(0, num_stages - n_layers)
+        
+        for i, stage in enumerate(stages):
+            requires_grad = (i >= freeze_until)
+            for param in stage.parameters():
+                param.requires_grad = requires_grad
 
-            print(f"➡️ Encoder frozen except for last {n_layers} stage(s).")
-        if optimizer is not None:
-            print(f"OLd LR: {optimizer.param_groups[1]['lr']}")
-            optimizer = rebuild_optimizer_preserve_state(optimizer, model, new_lr_ratio)
-            print("🧩 Optimizer updated (state pruned).")
-            print(f"Optimzer new LR: {optimizer.param_groups[1]['lr']}")   
+        print(f"➡️ {encoder_name} frozen except for last {n_layers} stage(s).")
+    
+    # --- 4. Optimizer Rebuild ---
+    if optimizer is not None:
+        
+        print(f"OLd LR: {optimizer.param_groups[1]['lr']}")
+        optimizer = rebuild_optimizer_preserve_state(optimizer, model, new_lr_ratio) 
+        print("🧩 Optimizer updated (state prune/rebuild 필요).")
+        print(f"Optimzer new LR: {optimizer.param_groups[1]['lr']}") 
 
     return optimizer
 
@@ -790,6 +813,11 @@ def evaluate(
             dice_loss = dice_loss_fn(logit_map, masks)
             img_loss = is_forged_img_loss_fn(is_forged_logit, is_forged)
             loss = alpha * cls_loss*loss_scaler + beta * dice_loss + img_loss*gamma
+        
+        else:
+            cls_loss = cls_loss_fn(logit_map, masks)
+            dice_loss = dice_loss_fn(logit_map, masks)
+            loss = alpha * cls_loss*loss_scaler + beta * dice_loss
 
         total_loss += loss.item()
         cls_total += cls_loss.item()
@@ -898,7 +926,10 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
     bce_total = 0
     dice_total = 0
     is_forged_img_loss = 0
-    activation_module = getattr(model.classification_head[-1], 'activation', None)
+    try:
+        activation_module = getattr(model.classification_head[-1], 'activation', None)
+    except:
+        activation_module = None
 
     if activation_module is None:
         is_forged_img_loss_fn = torch.nn.BCEWithLogitsLoss()
@@ -939,6 +970,10 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
                 # is_forged_logit = is_forged_logit.clamp(min=-20, max=20)
             else:
                 outputs = model(imgs)
+                if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                    print("[NaN DETECTED] step=", step, " paths=", path)
+                outputs = torch.nan_to_num(outputs, nan=0.0, neginf=-4.8, posinf=4.8)
+                outputs = outputs / (outputs.abs() / 4.8 + 1)
                 
         if getattr(model, 'classification_head', None) is not None:
             cls_loss = cls_loss_fn(outputs, masks)
@@ -953,6 +988,9 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
         else:
             cls_loss = cls_loss_fn(outputs, masks)
             dice_loss = dice_loss_fn(outputs, masks)
+            if torch.isnan(dice_loss):
+                    print(f"[NaN DETECTED] Skipping backward at step {step}")
+                    dice_loss = torch.nan_to_num(dice_loss, nan=0.0, posinf=1.0, neginf=0.0)
             loss = alpha * cls_loss*loss_scaler + beta * dice_loss
 
         if torch.isnan(loss).any() or torch.isinf(loss).any():
@@ -974,16 +1012,64 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
         if scheduler and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step()
 
-        encoder_norm = torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), max_norm=float("inf"))
-        decoder_norm = torch.nn.utils.clip_grad_norm_(model.decoder.parameters(), max_norm=float("inf"))
-        cls_head_norm = torch.nn.utils. clip_grad_norm_(model.classification_head.parameters(), max_norm=float("inf")) if getattr(model, 'classification_head', None) is not None else None
+        # --- 모델 구조에 따라 대상 모듈 설정 ---
+        # ViT 기반 모델 (DINOv2)
+        if hasattr(model, 'backbone'):
+            backbone_params = model.backbone.parameters()
+            # ViT 모델은 보통 decoder_low, decoder_high를 가집니다.
+            decoder_params = list(model.decoder_low.parameters()) + list(model.decoder_high.parameters())
+            encoder_norm_target_name = 'backbone'
+            
+        # CNN 기반 모델 (SMP/기존)
+        elif hasattr(model, 'encoder'):
+            backbone_params = model.encoder.parameters()
+            decoder_params = model.decoder.parameters() if hasattr(model, 'decoder') else None
+            encoder_norm_target_name = 'encoder'
+            
+        else:
+            # 예외 처리: 대상 모듈을 찾을 수 없을 때
+            backbone_params = None
+            decoder_params = None
+            encoder_norm_target_name = 'unknown'
+
+        # ----------------------------------------------------
+        # 💡 기울기 노름 계산 (max_norm="inf"로 클리핑 비활성화)
+        # ----------------------------------------------------
+
+        # 1. Backbone/Encoder Norm 계산
+        if backbone_params is not None:
+            # Backbone/Encoder의 기울기 Norm 계산 (실제 클리핑 없이 노름 값만 얻음)
+            encoder_norm = torch.nn.utils.clip_grad_norm_(backbone_params, max_norm=float("inf"))
+        else:
+            encoder_norm = None
+            print("[Norm] Backbone/Encoder 모듈을 찾을 수 없음.")
+
+
+        # 2. Decoder Norm 계산
+        if decoder_params is not None:
+            # Decoder의 기울기 Norm 계산
+            decoder_norm = torch.nn.utils.clip_grad_norm_(decoder_params, max_norm=float("inf"))
+        else:
+            decoder_norm = None
+            print("[Norm] Decoder 모듈을 찾을 수 없음.")
+
+
+        # 3. Classification Head Norm 계산 (기존 로직 유지)
+        cls_head_norm = None
+        if getattr(model, 'classification_head', None) is not None:
+            cls_head_norm = torch.nn.utils.clip_grad_norm_(model.classification_head.parameters(), max_norm=float("inf"))
+        else:
+            cls_head_norm = 0.0
+        
+
         global_step = (epoch-1) * len(train_loader) + step
 
         if writer is not None:
             writer.add_scalar("Loss/Train_step", loss.item(), global_step)
             writer.add_scalar("Loss/Cls_step", cls_loss.item(), global_step)
             writer.add_scalar("Loss/Dice_step", dice_loss.item(), global_step)
-            writer.add_scalar("Loss/Img_step", img_loss.item(), global_step)   
+            if getattr(model, 'classification_head', None) is not None:
+                writer.add_scalar("Loss/Is_forged_step", img_loss.item(), global_step)
             writer.add_scalar("Loss/Total_step", loss.item(), global_step) 
             writer.add_scalar("Norm/Encoder", encoder_norm, global_step)
             writer.add_scalar("Norm/Decoder", decoder_norm, global_step)
