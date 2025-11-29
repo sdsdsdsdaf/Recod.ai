@@ -1,6 +1,24 @@
 import os
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
+import warnings
+# ===== Warning Filtering =====
+# Triton / xFormers 관련 워닝 숨기기 (성능 최적화 관련, 정확도에는 영향 없음)
+warnings.filterwarnings(
+    "ignore",
+    message="A matching Triton is not available, some optimizations will not be enabled"
+)
+warnings.filterwarnings(
+    "ignore",
+    module="xformers"
+)
+
+# lr_scheduler.step() 호출 순서 관련 워닝 숨기기
+warnings.filterwarnings(
+    "ignore",
+    message="Detected call of `lr_scheduler.step\\(\\)` before `optimizer.step\\(\\)`"
+)
+
 import torch
 from sklearn.model_selection import train_test_split, KFold
 from torch.utils.data import DataLoader, Subset
@@ -10,6 +28,8 @@ import torch.nn as nn
 import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.losses import FocalLoss
 import cv2
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 from datetime import timedelta
 from time import time
 from transformers import get_cosine_schedule_with_warmup
@@ -145,6 +165,8 @@ def cross_val_score(
         optimizer_cls=torch.optim.Adam,
         scheduler_cls=None,
         scheduler_params=None,
+        train_transform=None,
+        test_transform=None,
         use_amp=False,
         use_log=False,
         run_name=None,
@@ -230,12 +252,15 @@ def cross_val_score(
             fold=fold+1, use_amp=use_amp, use_log=use_log, writer=writer,
             freeze_epoch=freeze_epoch, freeze_layer=freeze_layer, after_freeze_lr=after_freeze_lr,
             new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma,
+            train_transform=train_transform, test_transform=test_transform,
         )
         
         score = evaluate(
             model, val_loader, device, cls_loss, dice_loss, alpha, beta, gamma, loss_scaler,
-            interpolation=interpolation, threshold=threshold,            min_area_ratio=min_area_ratio, low_conf_max_prob=low_conf_max_prob,     
-            low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel
+            interpolation=interpolation, threshold=threshold,
+            min_area_ratio=min_area_ratio, low_conf_max_prob=low_conf_max_prob,
+            low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel,
+            train_transform=train_transform, test_transform=test_transform,
         )
         fold_end_time = time()
         elapsed_time = fold_end_time - fold_start_time
@@ -271,12 +296,11 @@ if __name__ == "__main__":
     INTERPOLATION = cv2.INTER_NEAREST
 
     #Post Processing HyperParams
-    THRESHOLD = 0.3
+    THRESHOLD = 0.5
     LOW_CONF_MAX_PROB = 0.06
     LOW_VIZ_THR = 0.04
     LOW_CONF_MIN_PIXEL = 128
-    MIN_AREA_RATIO = 0.001
-    THRESHOLD = 0.5
+    MIN_AREA_RATIO = 0.002
     TRAIN_SAMPLE_NUM = None
     TEST_SAMPLE_NUM = None
 
@@ -287,9 +311,23 @@ if __name__ == "__main__":
         'test_images': TEST_DIR
     }
 
+    # Preprocessing
+    IMG_SIZE = 224
+    train_transform = A.Compose([
+        # HDF5에는 storage_size(256)로 저장되어 있음 -> 여기서 224로 랜덤 크롭
+        A.RandomCrop(IMG_SIZE, IMG_SIZE), 
+        A.HorizontalFlip(p=0.5),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
+    ])
+    test_transform = A.Compose([
+        # 테스트 때는 중앙 크롭 혹은 그냥 리사이즈 -> 슬라이딩 윈도우 방식 고려려
+        A.Resize(IMG_SIZE, IMG_SIZE),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2()
+    ])
 
     #Learning HyperParams
-    IMG_SIZE = 224
     full_ds = HybridDataset(
         "train_data_dino.h5",
         paths['train_authentic'],
@@ -298,14 +336,18 @@ if __name__ == "__main__":
         img_size=IMG_SIZE,
         is_train=True,
         preload=True,
-        verbose=True
+        verbose=True,
+        train_transform=train_transform,
+        test_transform=test_transform,
+        train_sample_num=TRAIN_SAMPLE_NUM,
+        test_sample_num=TEST_SAMPLE_NUM
     )
 
     BATCH_SIZE = 32
     NUM_EPOCHS = 40
     NEW_LR_RATIO = 0.1
     FREEZE_EPOCH = 10
-    FREEZE_LAYER = None
+    FREEZE_LAYER = None 
     LR = 1e-3
     # POS_W = torch.tensor(1) # Resized
     MODEL_CLS = SimpleDINOv2
@@ -385,7 +427,7 @@ if __name__ == "__main__":
         low_viz_thr=LOW_VIZ_THR, low_conf_min_pixel=LOW_CONF_MIN_PIXEL, lr=LR, use_log=USE_LOG,
         optimizer_cls=optimizer_cls, scheduler_cls=get_cosine_schedule_with_warmup, scheduler_params=scheduler_params, use_amp=USE_AMP,
         freeze_epoch=FREEZE_EPOCH, freeze_layer=FREEZE_LAYER, after_freeze_lr=NEW_LR_RATIO,  run_name=RUN_NAME,
-        new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma,
+        new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma, train_transform=train_transform, test_transform=test_transform,
 
         encoder_name="efficientnet-b3", encoder_weights="imagenet", #모델 파라미터
         in_channels=3, classes=1, activation=None, aux_params={

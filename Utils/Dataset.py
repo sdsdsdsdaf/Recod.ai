@@ -76,6 +76,8 @@ class HybridDataset(Dataset):
                  is_train=True,
                  preload=False,
                  verbose=False,
+                 train_transform: A.Compose=None,
+                 test_transform: A.Compose=None,
                  train_sample_num=None,
                  test_sample_num=None
                 ):
@@ -97,20 +99,9 @@ class HybridDataset(Dataset):
         # 🔥 [핵심] Albumentations 변환 정의
         # -----------------------------------------------------------
         if self.is_train:
-            self.transform = A.Compose([
-                # HDF5에는 storage_size(256)로 저장되어 있음 -> 여기서 224로 랜덤 크롭
-                A.RandomCrop(self.img_size, self.img_size), 
-                A.HorizontalFlip(p=0.5),
-                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                ToTensorV2()
-            ])
+            self.transform = train_transform
         else:
-            self.transform = A.Compose([
-                # 테스트 때는 중앙 크롭 혹은 그냥 리사이즈 -> 슬라이딩 윈도우 방식 고려려
-                A.Resize(self.img_size, self.img_size),
-                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                ToTensorV2()
-            ])
+            self.transform = test_transform
 
         # collect file paths
         for path, is_forged in [(authentic_path, 0), (forged_path, 1)]:

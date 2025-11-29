@@ -533,6 +533,7 @@ def train(
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, # PostProcessing Setting,
         fold=None, use_amp=False, use_log=False, freeze_epoch=15, freeze_layer=None, after_freeze_lr=None,
         writer: Optional[SummaryWriter] =None, new_alpha=0.2, new_beta=0.8, new_gamma=0.0,
+        train_transform=None, test_transform=None,
     ):
 
     train_loss_log_dict = defaultdict(list)
@@ -601,7 +602,9 @@ def train(
             low_conf_max_prob=low_conf_max_prob, 
             low_viz_thr=low_viz_thr, 
             low_conf_min_pixel=low_conf_min_pixel, 
-            scaler=scaler
+            scaler=scaler,
+            train_transform=train_transform,
+            test_transform=test_transform
         )
         
         print(f"[{E}/{epoch}] VAL F1: {metric_score['f1_score']:.4f}"
@@ -783,7 +786,7 @@ def train(
 @torch.no_grad()
 def evaluate(
         model, val_loader, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=8,
-        interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002,
+        interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, train_transform=None, test_transform=None,
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, scaler=None,
     ):
     model.eval()
@@ -867,6 +870,7 @@ def evaluate(
         model, None, device, test_path_file_list=file_path_list, img_size=img.shape[1],
         max_size=None, interpolation=interpolation, threshold=threshold, min_area_ratio=min_area_ratio,
         low_conf_max_prob=low_conf_max_prob, low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel,
+        train_transform=train_transform, test_transform=test_transform
     )
     del img, imgs, masks, logit_map, cls_loss, dice_loss, loss
     torch.cuda.empty_cache()
@@ -1113,7 +1117,7 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
     }
 
 
-def predict(model, test_path, device, test_path_file_list=None, img_size=128, max_size=None, interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, low_conf_max_prob = 0.06, low_viz_thr = 0.04, low_conf_min_pixel = 128, scaler: Optional[torch.amp.GradScaler] = None) -> dict[str, str]:
+def predict(model, test_path, device, test_path_file_list=None, img_size=128, max_size=None, interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, low_conf_max_prob = 0.06, low_viz_thr = 0.04, low_conf_min_pixel = 128, scaler: Optional[torch.amp.GradScaler] = None, train_transform=None, test_transform=None) -> dict[str, str]:
 
     """
     Return RLE string
@@ -1140,10 +1144,13 @@ def predict(model, test_path, device, test_path_file_list=None, img_size=128, ma
             img = cv2.imread(img_path)
             original_size = img.shape[:2]
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            processed_img = preprocessing(img, img_size, interpolation)
+            # processed_img = preprocessing(img, img_size, interpolation) -> NN방식 ImageNet 분산으로 바꾸지 않음
+            # img_tensor = torch.from_numpy(processed_img)
 
-            img_tensor = torch.from_numpy(processed_img)
-            img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).contiguous()
+            # Albumentations의 ToTensorV2는 이미 [C, H, W] 형태 텐서를 반환하므로,
+            # 추가 permute 없이 배치 차원만 추가해 DINO에 전달한다.
+            img_tensor: torch.Tensor = test_transform(image=img)['image']  # [C, H, W]
+            img_tensor = img_tensor.unsqueeze(0).contiguous()    
             img_tensor = img_tensor.to(device)
             min_area = int(original_size[0] * original_size[1] * min_area_ratio)
 
