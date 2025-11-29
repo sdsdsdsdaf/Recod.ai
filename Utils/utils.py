@@ -1084,7 +1084,8 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
             writer.add_scalar("Norm/Decoder", decoder_norm, global_step)
             writer.add_scalar("Norm/Cls_head", cls_head_norm, global_step)
             writer.add_scalar("LR/encoder", optimizer.param_groups[0]["lr"], global_step)
-            writer.add_scalar("LR/decoder", optimizer.param_groups[1]["lr"], global_step)
+            if getattr(model, 'classification_head', None) is not None:
+                writer.add_scalar("LR/decoder", optimizer.param_groups[1]["lr"], global_step)
 
         total_loss += loss.item()
         bce_total += cls_loss.item()
