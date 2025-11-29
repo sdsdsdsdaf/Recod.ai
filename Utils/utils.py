@@ -396,7 +396,10 @@ def freeze_encoder_after_epoch(
         print(f"OLd LR: {optimizer.param_groups[1]['lr']}")
         optimizer = rebuild_optimizer_preserve_state(optimizer, model, new_lr_ratio) 
         print("🧩 Optimizer updated (state prune/rebuild 필요).")
-        print(f"Optimzer new LR: {optimizer.param_groups[1]['lr']}") 
+        try:
+            print(f"Optimzer new LR: {optimizer.param_groups[1]['lr']}")
+        except:
+            print(f'Optimizer new LR: {optimizer.param_groups[0]["lr"]}')
 
     return optimizer
 
