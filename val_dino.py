@@ -325,7 +325,7 @@ if __name__ == "__main__":
         ToTensorV2()
     ])
     test_transform = A.Compose([
-        # 테스트 때는 중앙 크롭 혹은 그냥 리사이즈 -> 슬라이딩 윈도우 방식 고려려
+        # 테스트 때는 중앙 크롭 혹은 그냥 리사이즈 -> 슬라이딩 윈도우 방식 고려
         A.Resize(IMG_SIZE, IMG_SIZE),
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2()
@@ -350,15 +350,15 @@ if __name__ == "__main__":
     BATCH_SIZE = 32
     NUM_EPOCHS = 40
     NEW_LR_RATIO = 0.3
-    FREEZE_EPOCH = 10
+    FREEZE_EPOCH = 20
     FREEZE_LAYER = None 
-    LR = 1e-4
+    LR = 5e-4
     # POS_W = torch.tensor(1) # Resized
     MODEL_CLS = DINOv2SegmentationModel
     POS_W_RATIO = 0.25
     POS_W = compute_pos_weight(dataset=full_ds, h5_path="train_data_dino.h5") * POS_W_RATIO
     cls_loss = SoftBCEWithLogitsLoss(pos_weight=POS_W, smooth_factor=0.02)
-    DECODER_TYPE = 'simple_mlp'
+    DECODER_TYPE = 'unet_style' # [simple_mlp, unet_style, cnn_se, cnn_cbam]
     VIT_DIM = 384
     NUM_CLASSES = 1
 
@@ -418,8 +418,8 @@ if __name__ == "__main__":
     USE_AMP = False
 
     #ACK
-    USE_LOG = False
-    RUN_NAME = "DINO_V2_Unet_Decoder_bce_loss-alpha=0.7_new_alpha=0.1-loss-scaler=1-POS_W_RATIO=0.25 Optimizer State pruned LR x0.1"
+    USE_LOG = True
+    RUN_NAME = "DINO_V2_UNet_Decoder_bce_loss-alpha=0.7_new_alpha=0.1-loss-scaler=1-POS_W_RATIO=0.25 Optimizer State pruned LR x0.1"
 
 
     print_hyperparams()

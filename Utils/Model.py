@@ -190,7 +190,7 @@ class DINOv2SegmentationModel(nn.Module):
         # [A] Low-Res Processing (뇌: 16x16에서 정보 압축 및 판단)
         # DINO 출력(384) -> 128로 압축
         self.decoder = SegDecoder(decoder_type, vit_dim, num_classes, img_size)
-        self.apply(self._init_weights)
+        self.decoder.apply(self._init_weights)
         print("Weight initalization complete.")
 
     def forward(self, x):
@@ -206,12 +206,16 @@ class DINOv2SegmentationModel(nn.Module):
 
     # 모든 모듈에 대해 초기화를 적용하는 헬퍼 함수
     def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                init.constant_(m.bias, 0)
         if isinstance(m, nn.Conv2d):
             # Kaiming Normal (He) 초기화 적용 (ReLU 사용 시 표준)
             init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
                 init.constant_(m.bias, 0)
-        elif isinstance(m, nn.BatchNorm2d):
+        elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.GroupNorm) or isinstance(m, nn.LayerNorm):
             # BatchNorm 초기화 (weight=1, bias=0)
             init.constant_(m.weight, 1)
             init.constant_(m.bias, 0)
