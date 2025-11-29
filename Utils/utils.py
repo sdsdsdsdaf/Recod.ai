@@ -1030,7 +1030,7 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
         if hasattr(model, 'backbone'):
             backbone_params = model.backbone.parameters()
             # ViT 모델은 보통 decoder_low, decoder_high를 가집니다.
-            decoder_params = list(model.decoder_low.parameters()) + list(model.decoder_high.parameters())
+            decoder_params = model.decoder.parameters() if hasattr(model, 'decoder') else None
             encoder_norm_target_name = 'backbone'
             
         # CNN 기반 모델 (SMP/기존)

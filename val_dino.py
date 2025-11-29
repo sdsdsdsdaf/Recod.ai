@@ -34,7 +34,7 @@ from datetime import timedelta
 from time import time
 from transformers import get_cosine_schedule_with_warmup
 
-from Utils.Model import SimpleDINOv2
+from Utils.Model import DINOv2SegmentationModel
 from Utils.Loss import FocalTverskyLoss
 from torch.utils.tensorboard import SummaryWriter
 from segmentation_models_pytorch.losses.soft_bce import SoftBCEWithLogitsLoss
@@ -204,19 +204,23 @@ def cross_val_score(
         scheduler_params["num_training_steps"] = total_steps
 
         model = model_cls(**kwargs)
+        if fold == 0: print(model)
         
         #TODO 후에 하드코딩아닌 함수인자로 받기
 # --- [모델 & 최적화 준비] ---
 # ... (model, optimizer_cls, lr 정의는 그대로) ...
 
 # 💡 모델 구조에 따라 파라미터 그룹 동적 설정
-        if hasattr(model, 'encoder'):
+        if hasattr(model, 'encoder') or hasattr(model, 'backbone'):
             # A. SMP (Unet/DeepLab) 구조일 때
+            if hasattr(model, 'encoder'):
+                params = model.encoder.parameters()
+            elif hasattr(model, 'backbone'):
+                params = model.backbone.parameters()
+
             params_group = [
-                {"params": model.encoder.parameters(), "lr": lr*0.5},
+                {"params": params, "lr": lr*0.5},
                 {"params": model.decoder.parameters(), "lr": lr},
-                # segmentation_head와 classification_head는 없을 수도 있지만,
-                # 에러를 피하기 위해 try/except 대신 if/else로 처리
             ]
             if hasattr(model, 'segmentation_head'):
                 params_group.append({"params": model.segmentation_head.parameters(), "lr": lr})
@@ -345,15 +349,19 @@ if __name__ == "__main__":
 
     BATCH_SIZE = 32
     NUM_EPOCHS = 40
-    NEW_LR_RATIO = 0.1
+    NEW_LR_RATIO = 0.3
     FREEZE_EPOCH = 10
     FREEZE_LAYER = None 
-    LR = 1e-3
+    LR = 1e-4
     # POS_W = torch.tensor(1) # Resized
-    MODEL_CLS = SimpleDINOv2
+    MODEL_CLS = DINOv2SegmentationModel
     POS_W_RATIO = 0.25
     POS_W = compute_pos_weight(dataset=full_ds, h5_path="train_data_dino.h5") * POS_W_RATIO
     cls_loss = SoftBCEWithLogitsLoss(pos_weight=POS_W, smooth_factor=0.02)
+    DECODER_TYPE = 'simple_mlp'
+    VIT_DIM = 384
+    NUM_CLASSES = 1
+
     """
     cls_loss = FocalLoss(
         mode='binary',
@@ -410,8 +418,8 @@ if __name__ == "__main__":
     USE_AMP = False
 
     #ACK
-    USE_LOG = True
-    RUN_NAME = "DINO_V2_bce_loss-alpha=0.7_new_alpha=0.1-loss-scaler=1-POS_W_RATIO=0.25 Optimizer State pruned LR x0.1"
+    USE_LOG = False
+    RUN_NAME = "DINO_V2_Unet_Decoder_bce_loss-alpha=0.7_new_alpha=0.1-loss-scaler=1-POS_W_RATIO=0.25 Optimizer State pruned LR x0.1"
 
 
     print_hyperparams()
@@ -435,7 +443,8 @@ if __name__ == "__main__":
             "pooling": "avg",       # global avg pooling
             "dropout": 0.3,
             "activation": None, # optional
-        }) 
+        }, decoder_type=DECODER_TYPE, vit_dim=VIT_DIM, num_classes=1, img_size=IMG_SIZE)
+
 
     print(f"CV is complete! Total Time: {timedelta(seconds=time() - cv_start_time)}")
 
