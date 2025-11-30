@@ -12,6 +12,7 @@ import cv2
 import torch
 import h5py
 import os
+from torch.fft import Tensor
 from tqdm.auto import tqdm
 import random
 from collections import defaultdict
@@ -67,6 +68,13 @@ def postprocessing(proba_map:np.ndarray, original_size:tuple[int, int], threshol
 
     return mask_pred
 """
+def to3dims(tensor:torch.Tensor): # tensor [H,W] -> [B,H,W]
+    if tensor is None:
+        return None
+    if tensor.ndim == 3:
+        return tensor
+    else:
+        return tensor.unsqueeze(0)
 
 def postprocessing(proba_map: np.ndarray,
                    original_size: tuple[int, int],
@@ -738,46 +746,45 @@ def train(
 
                 # ── TensorBoard 기록
                 writer.add_image(f"Samples/FOLD{fold}/epoch_{E}", grid_labeled, E)
+ 
+        for k, v in metric_score.items():
+            val_loss_log_dict[k].append(v)
+        if scheduler and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(metric_score['f1_score'])
 
-                
-            for k, v in metric_score.items():
-                val_loss_log_dict[k].append(v)
-            if scheduler and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(metric_score['f1_score'])
+        f1_log_list.append(metric_score['f1_score'])
+        if metric_score['f1_score'] > best1_f1:
+            print(f"🏆 Best1 F1: {metric_score['f1_score']:.4f} before {best1_f1:.4f}")
+            best1_f1 = metric_score['f1_score']
+        
+        if metric_score['f1_score'] > min(best5_f1):
+            best5_f1.remove(min(best5_f1))
+            best5_f1.append(metric_score['f1_score'])
+            sorted_best = sorted(best5_f1, reverse=True)
+            rank = sorted_best.index(metric_score['f1_score']) + 1
 
-            f1_log_list.append(metric_score['f1_score'])
-            if metric_score['f1_score'] > best1_f1:
-                print(f"🏆 Best1 F1: {metric_score['f1_score']:.4f} before {best1_f1:.4f}")
-                best1_f1 = metric_score['f1_score']
+            if fold is not None:
+                save_path = os.path.join("Weights", f"FOLD{fold}", f"best{rank}.pth")
+            else:
+                save_path = os.path.join("Weights", f"best{rank}.pth")
             
-            if metric_score['f1_score'] > min(best5_f1):
-                best5_f1.remove(min(best5_f1))
-                best5_f1.append(metric_score['f1_score'])
-                sorted_best = sorted(best5_f1, reverse=True)
-                rank = sorted_best.index(metric_score['f1_score']) + 1
+            try:
+                torch.save(model.state_dict(), save_path)
+                print(f"🔥 F1 {metric_score['f1_score']:.4f} entered Top5 → Rank {rank}/5")
+                print(f"💾 Saved checkpoint: {save_path}")
+            except Exception as e:
+                print(f"⚠️ Failed to save model at {save_path}: {e}")
+    epoch_end_time = time()
+    print(f"[EPOCH {E}/{epoch}] TIME : {timedelta(seconds=epoch_end_time - epoch_start_time)}")
 
-                if fold is not None:
-                    save_path = os.path.join("Weights", f"FOLD{fold}", f"best{rank}.pth")
-                else:
-                    save_path = os.path.join("Weights", f"best{rank}.pth")
-                
-                try:
-                    torch.save(model.state_dict(), save_path)
-                    print(f"🔥 F1 {metric_score['f1_score']:.4f} entered Top5 → Rank {rank}/5")
-                    print(f"💾 Saved checkpoint: {save_path}")
-                except Exception as e:
-                    print(f"⚠️ Failed to save model at {save_path}: {e}")
-            epoch_end_time = time()
-            print(f"[EPOCH {E}/{epoch}] TIME : {timedelta(seconds=epoch_end_time - epoch_start_time)}")
-
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        try:
-            torch.cuda.memory._free_cached_blocks()  # PyTorch 2.6에서 동작
-        except Exception:
-            pass
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+    try:
+        torch.cuda.memory._free_cached_blocks()  # PyTorch 2.6에서 동작
+    except Exception:
+        pass
  
     return {'train_loss': train_loss_log_dict, 'val_loss': val_loss_log_dict, 'f1_score': f1_log_list}
 
@@ -801,7 +808,7 @@ def evaluate(
     for imgs, masks, mask_path, is_forged in tqdm(val_loader, desc="Calculating Loss", leave=False):
 
         imgs, masks, is_forged = imgs.to(device, non_blocking=True), masks.to(device, non_blocking=True), is_forged.to(device, non_blocking=True)
-        masks = masks.squeeze()
+        masks:torch.Tensor = masks.squeeze()
         with autocast(device_type=device.type, enabled=scaler is not None):
             if getattr(model, 'classification_head', None) is not None:
                 logit_map, is_forged_logit = model(imgs)
@@ -810,10 +817,12 @@ def evaluate(
                 
 
             else:
-                logit_map = model(imgs)
+                logit_map:torch.Tensor = model(imgs)
                 logit_map = logit_map.squeeze(1)  # [B, 1, H, W] -> [B, H, W]
 
         logit_map, masks = logit_map.float(), masks.float()
+        logit_map = to3dims(logit_map)
+        masks = to3dims(masks)
 
         if getattr(model, 'classification_head', None) is not None:
             is_forged_logit, is_forged = is_forged_logit.float(), is_forged.float()
@@ -987,7 +996,10 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
                     print("[NaN DETECTED] step=", step, " paths=", path)
                 outputs = torch.nan_to_num(outputs, nan=0.0, neginf=-4.8, posinf=4.8)
                 outputs = outputs / (outputs.abs() / 4.8 + 1)
-                
+        
+        outputs = to3dims(outputs)
+        masks = to3dims(masks)
+        
         if getattr(model, 'classification_head', None) is not None:
             cls_loss = cls_loss_fn(outputs, masks)
             
