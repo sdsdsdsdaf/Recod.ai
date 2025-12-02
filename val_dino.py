@@ -26,7 +26,7 @@ from Utils.Dataset import HybridDataset
 from Utils.utils import compute_pos_weight, train, evaluate, set_seed
 import torch.nn as nn
 import segmentation_models_pytorch as smp
-from segmentation_models_pytorch.losses import FocalLoss
+from segmentation_models_pytorch.losses import FocalLoss, LovaszLoss
 import cv2
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -34,8 +34,9 @@ from datetime import timedelta
 from time import time
 from transformers import get_cosine_schedule_with_warmup
 
-from Utils.Model import DINOv2SegmentationModel
+from Utils.Model import DINOv2SegmentationModel, SwinTransformerSegmentationModel as Swin
 from Utils.Loss import FocalTverskyLoss
+from Utils.scheduler import cosine_with_min_lr
 from torch.utils.tensorboard import SummaryWriter
 from segmentation_models_pytorch.losses.soft_bce import SoftBCEWithLogitsLoss
 from datetime import datetime
@@ -173,6 +174,8 @@ def cross_val_score(
         new_alpha=0.2,
         new_beta=0.8,
         new_gamma=0.0,
+        use_t = False,
+        warmup_ratio=0.3,
         **kwargs,
     ):
 
@@ -200,8 +203,14 @@ def cross_val_score(
         # torch.autograd.set_detect_anomaly(True)
 
         total_steps = len(train_loader) * epoch
-        scheduler_params["num_warmup_steps"] = int(total_steps * 0.1)
-        scheduler_params["num_training_steps"] = total_steps
+        if scheduler_cls == get_cosine_schedule_with_warmup:
+            scheduler_params["num_warmup_steps"] = int(total_steps * warmup_ratio)
+            scheduler_params["num_training_steps"] = total_steps
+        elif scheduler_cls == cosine_with_min_lr:
+            scheduler_params["warmup_steps"] = int(total_steps * warmup_ratio)
+            scheduler_params["total_steps"] = total_steps
+        else:
+            raise ValueError("scheduler must be either get_cosine_schedule_with_warmup or cosine_with_min_lr")
 
         model = model_cls(**kwargs)
         if fold == 0: print(model)
@@ -219,7 +228,7 @@ def cross_val_score(
                 params = model.backbone.parameters()
 
             params_group = [
-                {"params": params, "lr": lr*0.5},
+                {"params": params, "lr": lr*0.2},
                 {"params": model.decoder.parameters(), "lr": lr},
             ]
             if hasattr(model, 'segmentation_head'):
@@ -241,7 +250,7 @@ def cross_val_score(
 
 
         # 최종 Optimizer 정의
-        optimizer = optimizer_cls(params_group, weight_decay=1e-3)  
+        optimizer = optimizer_cls(params_group, weight_decay=1e-4)  
 
         scheduler = scheduler_cls(optimizer, **scheduler_params) if scheduler_cls else None
         if scheduler_cls is not None: scheduler.last_epoch = -1; scheduler.step()
@@ -255,7 +264,7 @@ def cross_val_score(
             low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel,
             fold=fold+1, use_amp=use_amp, use_log=use_log, writer=writer,
             freeze_epoch=freeze_epoch, freeze_layer=freeze_layer, after_freeze_lr=after_freeze_lr,
-            new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma,
+            new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma, use_t=use_t,
             train_transform=train_transform, test_transform=test_transform,
         )
         
@@ -307,6 +316,7 @@ if __name__ == "__main__":
     MIN_AREA_RATIO = 0.002
     TRAIN_SAMPLE_NUM = None
     TEST_SAMPLE_NUM = None
+    TEMPERATURE = 2
 
     paths = {
         'train_authentic': os.path.join(TRAIN_DIR, "authentic"),
@@ -349,18 +359,22 @@ if __name__ == "__main__":
 
     BATCH_SIZE = 32
     NUM_EPOCHS = 40
-    NEW_LR_RATIO = 0.3
-    FREEZE_EPOCH = 20
+    NEW_LR_RATIO = 0.3 
+    FREEZE_EPOCH = 40
     FREEZE_LAYER = None 
-    LR = 5e-4
+    LR = 2.5e-4
+    WARMUP_RATIO = 0.3
     # POS_W = torch.tensor(1) # Resized
-    MODEL_CLS = DINOv2SegmentationModel
-    POS_W_RATIO = 0.25
+    MODEL_CLS = Swin
+    POS_W_RATIO = 0.1
     POS_W = compute_pos_weight(dataset=full_ds, h5_path="train_data_dino.h5") * POS_W_RATIO
-    cls_loss = SoftBCEWithLogitsLoss(pos_weight=POS_W, smooth_factor=0.02)
-    DECODER_TYPE = 'unet_style' # [simple_mlp, unet_style, cnn_se, cnn_cbam]
+    cls_loss = SoftBCEWithLogitsLoss(pos_weight=POS_W, smooth_factor=0.1)
+    DECODER_TYPE = 'cnn_cbam' # [simple_mlp, unet_style, cnn_se, cnn_cbam] 
     VIT_DIM = 384
     NUM_CLASSES = 1
+    USE_T = True
+    DECODER_EMB_CH = 256
+    DECODER_DROPOUT_RATIO = 0.1
 
     """
     cls_loss = FocalLoss(
@@ -374,8 +388,9 @@ if __name__ == "__main__":
     """
     
     
-
-    # 2️⃣ FN penalty 완화된 FocalTverskyLoss (mask overlap 중심)
+    # TODO 
+    dice_loss = LovaszLoss(mode='binary', per_image=False, ignore_index=None)
+    """
     dice_loss = FocalTverskyLoss(
         mode="binary",
         alpha=0.35,        # 0.3 → 0.4 : FP penalty 강화 → forged mask를 더 타이트하게
@@ -385,6 +400,8 @@ if __name__ == "__main__":
         from_logits=True,
         smooth=1e-5
     )
+    """
+
     """
     dice_loss = smp.losses.TverskyLoss(
         mode='binary',       # binary / multiclass / multilabel
@@ -405,10 +422,19 @@ if __name__ == "__main__":
     new_gamma = 0.0
     optimizer_cls = torch.optim.AdamW
 
+    """
     scheduler_cls = get_cosine_schedule_with_warmup
     scheduler_params = {
         "num_warmup_steps": None,   # 아래에서 계산됨
         "num_training_steps": None, # 아래에서 계산됨
+    }
+    """
+
+    scheduler_cls = cosine_with_min_lr
+    scheduler_params = {
+        "warmup_steps": None,       # 아래에서 계산됨
+        "total_steps": None,        # 아래에서 계산됨
+        "min_lr": 1e-6,
     }
 
 
@@ -419,7 +445,7 @@ if __name__ == "__main__":
 
     #ACK
     USE_LOG = True
-    RUN_NAME = "DINO_V2_UNet_Decoder_bce_loss-alpha=0.7_new_alpha=0.1-loss-scaler=1-POS_W_RATIO=0.25 Optimizer State pruned LR x0.1"
+    RUN_NAME = "Swin_Transformer_SegFomer_min_lr=1e-6_bce_loss-alpha=0.7_new_alpha=0.1-loss-scaler=1-POS_W_RATIO=0.05 Optimizer State pruned LR x0.1"
 
 
     print_hyperparams()
@@ -428,22 +454,31 @@ if __name__ == "__main__":
     cv_start_time = time()
     train_log = cross_val_score(
         MODEL_CLS, k=5, dataset=full_ds, device=device, batch_size=BATCH_SIZE,
-        ues_pin_memory=USE_PIN_MEM, num_workers=NUM_WORKERS, pos_w=POS_W,
-        cls_loss=cls_loss, dice_loss=dice_loss, loss_scaler=loss_scaler,
+        ues_pin_memory=USE_PIN_MEM, num_workers=NUM_WORKERS, cls_loss=cls_loss, dice_loss=dice_loss, loss_scaler=loss_scaler,
         alpha=alpha, beta=beta, gamma=gamma, epoch=NUM_EPOCHS, interpolation=INTERPOLATION,
         threshold=THRESHOLD, min_area_ratio=MIN_AREA_RATIO, low_conf_max_prob=LOW_CONF_MAX_PROB,
-        low_viz_thr=LOW_VIZ_THR, low_conf_min_pixel=LOW_CONF_MIN_PIXEL, lr=LR, use_log=USE_LOG,
-        optimizer_cls=optimizer_cls, scheduler_cls=get_cosine_schedule_with_warmup, scheduler_params=scheduler_params, use_amp=USE_AMP,
-        freeze_epoch=FREEZE_EPOCH, freeze_layer=FREEZE_LAYER, after_freeze_lr=NEW_LR_RATIO,  run_name=RUN_NAME,
+        low_viz_thr=LOW_VIZ_THR, low_conf_min_pixel=LOW_CONF_MIN_PIXEL, lr=LR, use_log=USE_LOG, warmup_ratio=WARMUP_RATIO,
+        optimizer_cls=optimizer_cls, scheduler_cls=scheduler_cls, scheduler_params=scheduler_params, use_amp=USE_AMP,
+        freeze_epoch=FREEZE_EPOCH, freeze_layer=FREEZE_LAYER, after_freeze_lr=NEW_LR_RATIO,  run_name=RUN_NAME, use_t=USE_T,
         new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma, train_transform=train_transform, test_transform=test_transform,
+        
+        # Model Specific Args
+        backbone_name='swin_base_patch4_window7_224',
+        decoder_type='segformer',
+        num_classes=1,
+        emb_ch=DECODER_EMB_CH,
+        dropout_ratio=DECODER_DROPOUT_RATIO,
+    )
 
-        encoder_name="efficientnet-b3", encoder_weights="imagenet", #모델 파라미터
-        in_channels=3, classes=1, activation=None, aux_params={
-            "classes": 1,           # 출력 클래스 개수
-            "pooling": "avg",       # global avg pooling
-            "dropout": 0.3,
-            "activation": None, # optional
-        }, decoder_type=DECODER_TYPE, vit_dim=VIT_DIM, num_classes=1, img_size=IMG_SIZE)
+    '''
+    encoder_name="efficientnet-b3", encoder_weights="imagenet", #모델 파라미터
+    in_channels=3, classes=1, activation=None, aux_params={
+        "classes": 1,           # 출력 클래스 개수
+        "pooling": "avg",       # global avg pooling
+        "dropout": 0.3,
+        "activation": None, # optional
+    }, decoder_type=DECODER_TYPE, vit_dim=VIT_DIM, num_classes=1, img_size=IMG_SIZE
+    '''
 
 
     print(f"CV is complete! Total Time: {timedelta(seconds=time() - cv_start_time)}")

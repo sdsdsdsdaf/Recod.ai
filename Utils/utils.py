@@ -23,11 +23,8 @@ from pytorch_toolbelt import losses as L
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
-    try:
-        from tensorboard import SummaryWriter
-    except ImportError:
-        SummaryWriter = None
-        print("Warning: tensorboard not available. Logging will be disabled.")
+    SummaryWriter = None
+    print("Warning: tensorboard not available. Logging will be disabled.")
 from PIL import Image, ImageDraw, ImageFont
 import torch
 
@@ -540,8 +537,8 @@ def train(
         interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.02,
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, # PostProcessing Setting,
         fold=None, use_amp=False, use_log=False, freeze_epoch=15, freeze_layer=None, after_freeze_lr=None,
-        writer: Optional[SummaryWriter] =None, new_alpha=0.2, new_beta=0.8, new_gamma=0.0,
-        train_transform=None, test_transform=None,
+        writer=None, new_alpha=0.2, new_beta=0.8, new_gamma=0.0,
+        train_transform=None, test_transform=None, use_t=False,
     ):
 
     train_loss_log_dict = defaultdict(list)
@@ -585,7 +582,9 @@ def train(
             loss_scaler=loss_scaler, 
             scaler=scaler,
             log_file=None,
-            writer=writer
+            use_t=use_t,
+            writer=writer,
+            freeze_epoch=freeze_epoch,
         )
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"[{E}/{epoch}] CLS LOSS: {losses['loss_cls']:.4f} DICE LOSS: {losses['loss_dice']:.4f} IS FORGED IMG LOSS: {losses['loss_img']:.4f} \nSCALING CLS LOSS: {alpha*loss_scaler*losses['loss_cls']:.4f} SCALING DICE LOSS: {beta*losses['loss_dice']:.4f} SCALING IS FORGED IMG LOSS: {gamma*losses['loss_img']:.4f} TRAIN TOTAL LOSS: {losses['loss_total']:.4f} CURRENT LR: {current_lr:.7f}")
@@ -941,7 +940,7 @@ def mask_path2img_path(mask_path, is_forged):
 
 
 
-def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=1.0, scaler: Optional[torch.amp.GradScaler] = None, log_file=None, writer:SummaryWriter=None) -> dict[str, float]:
+def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=1.0, scaler: Optional[torch.amp.GradScaler] = None, log_file=None, use_t=False, freeze_epoch=10, writer=None) -> dict[str, float]:
 
     model.train()
     total_loss = 0
@@ -999,7 +998,7 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
         
         outputs = to3dims(outputs)
         masks = to3dims(masks)
-        
+
         if getattr(model, 'classification_head', None) is not None:
             cls_loss = cls_loss_fn(outputs, masks)
             
@@ -1014,8 +1013,8 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
             cls_loss = cls_loss_fn(outputs, masks)
             dice_loss = dice_loss_fn(outputs, masks)
             if torch.isnan(dice_loss):
-                    print(f"[NaN DETECTED] Skipping backward at step {step}")
-                    dice_loss = torch.nan_to_num(dice_loss, nan=0.0, posinf=1.0, neginf=0.0)
+                print(f"[NaN DETECTED] Skipping backward at step {step}")
+                dice_loss = torch.nan_to_num(dice_loss, nan=0.0, posinf=1.0, neginf=0.0)
             loss = alpha * cls_loss*loss_scaler + beta * dice_loss
 
         if torch.isnan(loss).any() or torch.isinf(loss).any():
@@ -1099,9 +1098,12 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
             writer.add_scalar("Norm/Encoder", encoder_norm, global_step)
             writer.add_scalar("Norm/Decoder", decoder_norm, global_step)
             writer.add_scalar("Norm/Cls_head", cls_head_norm, global_step)
-            writer.add_scalar("LR/encoder", optimizer.param_groups[0]["lr"], global_step)
-            if getattr(model, 'classification_head', None) is not None:
+            if epoch < freeze_epoch:
+                writer.add_scalar("LR/encoder", optimizer.param_groups[0]["lr"], global_step)
                 writer.add_scalar("LR/decoder", optimizer.param_groups[1]["lr"], global_step)
+            else:
+                writer.add_scalar("LR/decoder", optimizer.param_groups[0]["lr"], global_step)
+                
 
         total_loss += loss.item()
         bce_total += cls_loss.item()
@@ -1204,12 +1206,12 @@ def set_seed(seed: int = 42):
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # (CUDA ≥10.2용) 완전 결정적 연산
 
     # ⚠️ PyTorch 연산의 결정론적(deterministic) 설정
-    torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
     # PyTorch 2.0+ (optional): 결정론 모드 강제
     try:
-        torch.use_deterministic_algorithms(True)
+        torch.use_deterministic_algorithms(False)
     except Exception:
         pass
 

@@ -172,3 +172,65 @@ class SegDecoder(nn.Module):
             if mid_features is None or low_features is None:
                  raise ValueError("U-Net style decoders require mid_features and low_features.")
             return self._forward_unet_style(final_features, mid_features, low_features)
+
+
+# ==============================================================================
+#   Swin Transformer Decoder
+# ==============================================================================
+
+class SegFormerHead(nn.Module):
+    def __init__(self, in_chs, num_cls, emb_ch=256, dropout_ratio=0.1, *args, **kwargs) -> None:
+        """
+        SegFormer decoder head.
+
+        Args:
+            in_chs (list[int]): Input channel sizes for each stage.
+            out_ch (int): Number of output channels/classes.
+            emb_ch (int, optional): Embedding channel size.
+
+        Returns:
+            None
+        """
+        super().__init__(*args, **kwargs)
+
+        # Since each stage has a different channel depth, MLP (1x1 Conv) to fit all into embedded_dim (256)
+        self.proj = self.linear_layers = nn.ModuleList([
+            nn.Conv2d(c, emb_ch, kernel_size=1) for c in in_chs
+        ])
+
+        # Fusion layer
+        self.linear_fuse = nn.Sequential(
+            nn.Conv2d(emb_ch * 4, emb_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(emb_ch),
+            nn.ReLU(inplace=True)
+        )
+
+        self.dropout = nn.Dropout(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
+        self.classifier = nn.Conv2d(emb_ch, num_cls, kernel_size=1)
+
+    def forward(self, features:list[torch.Tensor]) -> torch.Tensor:
+        """
+        Args:
+            features (list[torch.Tensor]): List of feature maps from different stages.
+        Returns:
+            return (torch.Tensor): Segmentation Logit map.
+        """
+
+        upsampled_features = []
+        target_size = features[0].shape[2:]  
+        
+        
+        for i, x in enumerate(features):
+            x:torch.Tensor = self.proj[i](x) 
+            if x.shape[2:] != target_size:
+                x = F.interpolate(x, size=target_size, mode='bilinear', align_corners=False)
+            upsampled_features.append(x)
+
+        x = torch.cat(upsampled_features, dim=1)
+        x = self.linear_fuse(x)  
+        x = self.dropout(x)
+        x = self.classifier(x)  
+
+        return x
+
+# TODO UNET Decoder 구현 예정

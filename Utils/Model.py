@@ -1,11 +1,31 @@
 import torch
 import torch.nn as nn
 import segmentation_models_pytorch as smp
-
-import torch
-import torch.nn as nn
+import torch.nn.init as init
+try:
+    from Decoder import SegDecoder, SegFormerHead
+except ImportError:
+    from Utils.Decoder import SegDecoder, SegFormerHead
 import segmentation_models_pytorch as smp
 import math
+import timm
+import torch.nn.functional as F
+
+# 모든 모듈에 대해 초기화를 적용하는 헬퍼 함수
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            init.constant_(m.bias, 0)
+    if isinstance(m, nn.Conv2d):
+        # Kaiming Normal (He) 초기화 적용 (ReLU 사용 시 표준)
+        init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            init.constant_(m.bias, 0)
+    elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.GroupNorm) or isinstance(m, nn.LayerNorm):
+        # BatchNorm 초기화 (weight=1, bias=0)
+        init.constant_(m.weight, 1)
+        init.constant_(m.bias, 0)
 
 class FeatureHook:
     def __init__(self, name):
@@ -78,14 +98,7 @@ class SMPDeepLabV3PlusWithNorm(smp.DeepLabV3Plus):
             nn.init.zeros_(m.bias)
 
     
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.nn.init as init
-from Utils.Decoder import SegDecoder
 
-import torch
-import torch.nn as nn
 # DINOv2 모델을 로드했다고 가정
 # dino_v2_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
 
@@ -190,7 +203,7 @@ class DINOv2SegmentationModel(nn.Module):
         # [A] Low-Res Processing (뇌: 16x16에서 정보 압축 및 판단)
         # DINO 출력(384) -> 128로 압축
         self.decoder = SegDecoder(decoder_type, vit_dim, num_classes, img_size)
-        self.decoder.apply(self._init_weights)
+        self.decoder.apply(init_weights)
         print("Weight initalization complete.")
 
     def forward(self, x):
@@ -204,18 +217,89 @@ class DINOv2SegmentationModel(nn.Module):
         else:
              return self.decoder(final_f, mid_f, low_f)
 
-    # 모든 모듈에 대해 초기화를 적용하는 헬퍼 함수
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
-                init.constant_(m.bias, 0)
-        if isinstance(m, nn.Conv2d):
-            # Kaiming Normal (He) 초기화 적용 (ReLU 사용 시 표준)
-            init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
-                init.constant_(m.bias, 0)
-        elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.GroupNorm) or isinstance(m, nn.LayerNorm):
-            # BatchNorm 초기화 (weight=1, bias=0)
-            init.constant_(m.weight, 1)
-            init.constant_(m.bias, 0)
+
+
+
+class SwinTransformerSegmentationModel(nn.Module):
+    def __init__(self, backbone_name='swin_base_patch4_window7_224', decoder_type='segformer',  num_classes=1, emb_ch=256, dropout_ratio=0.1, *args,**kwargs):
+
+        """
+        Swin Transformer based Segmentaion Model.
+
+        Args:
+            backbone_name (str): Swin Transformer model name.
+            decoder_type (str): decoder type ['segformer'].
+            num_classes (int): Number of output class.
+            emb_ch (int): Decoder`s embedding channel size.
+            dropout_ratio (float): Decoder`s dropout ratio.
+        Returns:
+            torch.Tensor: Segmentation logits of shape (B, num_classes, H, W).
+        """
+
+        super().__init__(*args,**kwargs)
+        
+        # 1. Backbone (Swin Transformer)
+        print(f"🚀 Loading Backbone: {backbone_name} ...")
+        try:
+            self.backbone = timm.create_model(backbone_name, pretrained=True, features_only=True)
+        except:
+            self.backbone = timm.create_model(backbone_name, pretrained=False, features_only=True)
+        print("Backbone loaded.")
+        print(f"Backbone output channels: {self.backbone.feature_info.channels()}")
+
+        # ---------------------------------------------------------
+        # 2. Decoder (Segmentation Head)
+        # ---------------------------------------------------------
+        in_chs = self.backbone.feature_info.channels()
+        if decoder_type.lower() == 'segformer':
+            self.decoder = SegFormerHead(in_chs=in_chs, num_cls=num_classes, emb_ch=emb_ch, dropout_ratio=dropout_ratio)
+        else:
+            raise ValueError(f"Unsupported decoder type: {decoder_type}")
+        
+        self.decoder.apply(init_weights)
+        print("Weight initalization complete.")
+        
+    def forward(self, x:torch.Tensor):
+        """
+        Forward pass through the Swin Transformer backbone and segmentation head.
+        
+        Args:
+            x (torch.Tensor): Input image tensor of shape (B, C, H, W).
+        Returns:
+            torch.Tensor: Segmentation logits of shape (B, num_classes, H, W).
+        """
+        # x: [Batch, 3, H, W] (ex: 224x224)
+
+        input_size = x.shape[-2:]
+        features:list[torch.Tensor] = self.backbone(x)
+        if features[0].ndim == 4 and features[0].shape[1] not in self.backbone.feature_info.channels():
+            features = [f.permute(0, 3, 1, 2).contiguous() for f in features]
+
+        logit_map = self.decoder(features)
+
+        # features[0]: [B, 128, H/4, W/4]  (Detail, Forge Detect Low level Context) 
+        # features[1]: [B, 256, H/8, W/8]
+        # features[2]: [B, 512, H/16, W/16]
+        # features[3]: [B, 1024, H/32, W/32] (Global, High level Context)
+
+        logit_map = F.interpolate(logit_map, size=input_size, mode='bilinear', align_corners=False)
+
+        return logit_map
+    
+    
+# ==============================================================================
+
+if __name__ == "__main__":
+
+    model = SwinTransformerSegmentationModel(
+        backbone_name='swin_base_patch4_window7_224',
+        decoder_type='segformer',
+        num_classes=1,
+        emb_ch=256,
+        dropout_ratio=0.1
+    )
+    model.eval()
+
+    dummy_input = torch.randn(2, 3, 224, 224)  # 배치 크기 2, 이미지 크기 224x224
+    output = model(dummy_input)
+    print("Output shape:", output.shape)  # 예상 출력: (2, 1, 224, 224)
