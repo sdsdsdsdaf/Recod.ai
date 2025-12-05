@@ -357,7 +357,7 @@ if __name__ == "__main__":
         test_sample_num=TEST_SAMPLE_NUM
     )
 
-    BATCH_SIZE = 32
+    BATCH_SIZE = 20
     NUM_EPOCHS = 40
     NEW_LR_RATIO = 0.3 
     FREEZE_EPOCH = 40
@@ -389,8 +389,8 @@ if __name__ == "__main__":
     
     
     # TODO 
-    dice_loss = LovaszLoss(mode='binary', per_image=False, ignore_index=None)
-    """
+    # dice_loss = LovaszLoss(mode='binary', per_image=False, ignore_index=None)
+    
     dice_loss = FocalTverskyLoss(
         mode="binary",
         alpha=0.35,        # 0.3 → 0.4 : FP penalty 강화 → forged mask를 더 타이트하게
@@ -400,7 +400,7 @@ if __name__ == "__main__":
         from_logits=True,
         smooth=1e-5
     )
-    """
+    
 
     """
     dice_loss = smp.losses.TverskyLoss(
@@ -445,7 +445,7 @@ if __name__ == "__main__":
 
     #ACK
     USE_LOG = True
-    RUN_NAME = "Swin_Transformer_SegFomer_min_lr=1e-6_bce_loss-alpha=0.7_new_alpha=0.1-loss-scaler=1-POS_W_RATIO=0.05 Optimizer State pruned LR x0.1"
+    RUN_NAME = "Swin_Transformer_In1k_Unet_emb_ch=256_min_lr=1e-6_bce_loss_Focal_Tversky_Loss-alpha=0.7"
 
 
     print_hyperparams()
@@ -464,7 +464,7 @@ if __name__ == "__main__":
         
         # Model Specific Args
         backbone_name='swin_base_patch4_window7_224',
-        decoder_type='segformer',
+        decoder_type='unet',
         num_classes=1,
         emb_ch=DECODER_EMB_CH,
         dropout_ratio=DECODER_DROPOUT_RATIO,

@@ -3,9 +3,9 @@ import torch.nn as nn
 import segmentation_models_pytorch as smp
 import torch.nn.init as init
 try:
-    from Decoder import SegDecoder, SegFormerHead
+    from Decoder import SegDecoder, SegFormerHead, UNetDecoder
 except ImportError:
-    from Utils.Decoder import SegDecoder, SegFormerHead
+    from Utils.Decoder import SegDecoder, SegFormerHead, UNetDecoder
 import segmentation_models_pytorch as smp
 import math
 import timm
@@ -179,6 +179,81 @@ class DINOv2Extractor(nn.Module):
 
         return features
 
+class CrossAttentionFusion(nn.Module):
+    """
+    Lightweight Multi-Head Cross Attention Fusion
+    Args:
+        swin_feat (torch.Tensor): (B, C1, H, W)
+        dino_feat (torch.Tensor): (B, L, C2)  # DINO token sequence
+    Returns:
+        fused_feat : (B, C_out, H, W)
+    """
+
+    def __init__(self, swin_dim, dino_dim, out_dim=256, num_heads=4):
+        super().__init__()
+
+        # Project both encoders to a common dimension
+        self.q_proj = nn.Linear(swin_dim, out_dim, bias=False)
+        self.k_proj = nn.Linear(dino_dim, out_dim, bias=False)
+        self.v_proj = nn.Linear(dino_dim, out_dim, bias=False)
+
+        self.q_ln = nn.LayerNorm(out_dim)
+        self.k_ln = nn.LayerNorm(out_dim)
+        self.v_ln = nn.LayerNorm(out_dim)
+        self.out_ln = nn.LayerNorm(out_dim)
+        self.swin_ln = nn.LayerNorm(swin_dim)
+        self.final_ln = nn.LayerNorm(swin_dim)
+
+        # PyTorch Multi-head attention
+        self.mha = nn.MultiheadAttention(
+            embed_dim=out_dim,
+            num_heads=num_heads,
+            batch_first=True    # MHA expects (L, B, C)
+        )
+
+        # Final output projection
+        self.out_proj = nn.Linear(out_dim, swin_dim)
+
+    def forward(self, swin_feat:torch.Tensor, dino_tokens:torch.Tensor):
+        """
+        Args:
+            swin_feat   : (B, C1, H, W)
+            dino_tokens : (B, L, C2)
+            hw_shape    : tuple(H, W)
+        Returns:
+            fused_feat  : (B, C1, H, W)
+        """
+        B, C1, H, W = swin_feat.shape
+
+        # Flatten Swin (B, C1, H, W) → (B, H*W, C1)
+        swin_flat = swin_feat.flatten(2).transpose(1, 2)  # (B, HW, C1)
+
+        # Project Q, K, V
+        Q:torch.Tensor = self.q_proj(swin_flat)      # (B, HW, out_dim)
+        K:torch.Tensor = self.k_proj(dino_tokens)    # (B, L,  out_dim)
+        V:torch.Tensor = self.v_proj(dino_tokens)    # (B, L,  out_dim)
+
+        # LayerNorm
+        Q = self.q_ln(Q)
+        K = self.k_ln(K)
+        V = self.v_ln(V)
+        swin_flat = self.swin_ln(swin_flat)
+
+        # Cross-Attention: Swin queries, DINO keys/values
+        # attn_out: (B, HW, out_dim)
+        attn_out, attn_weights = self.mha(Q, K, V)
+        attn_out = self.out_ln(attn_out)
+        # Final projection back to swin_dim
+        fused:torch.Tensor = self.out_proj(attn_out)  # (B, HW, swin_dim)
+        
+        fused = fused + swin_flat  # Residual connection
+        fused = self.final_ln(fused)
+        # Reshape back to (B, C1, H, W)
+        fused = fused.transpose(1, 2).reshape(B, C1, H, W)
+
+        return fused
+
+
 class DINOv2SegmentationModel(nn.Module):
     def __init__(
         self, backbone_name='dinov2_vits14', freeze_backbone=True, use_skip_connections=True, 
@@ -253,6 +328,8 @@ class SwinTransformerSegmentationModel(nn.Module):
         in_chs = self.backbone.feature_info.channels()
         if decoder_type.lower() == 'segformer':
             self.decoder = SegFormerHead(in_chs=in_chs, num_cls=num_classes, emb_ch=emb_ch, dropout_ratio=dropout_ratio)
+        elif decoder_type.lower() == 'unet':
+            self.decoder = UNetDecoder(in_chs=in_chs, num_classes=num_classes, out_channels=emb_ch, dropout_ratio=dropout_ratio)
         else:
             raise ValueError(f"Unsupported decoder type: {decoder_type}")
         
@@ -286,7 +363,56 @@ class SwinTransformerSegmentationModel(nn.Module):
 
         return logit_map
     
-    
+class SwinDinoEnsembleModel(nn.Module):
+    def __init__(self, vit_dim=384, dino_backbone_name='dinov2_vits14', swin_backbone_name='swin_base_patch4_window7_224', decoder_type='segformer',  num_classes=1, emb_ch=256, ca_emb_ch=256, dropout_ratio=0.1, *args,**kwargs):
+        """
+        Swin Transformer + DINOv2 Ensemble based Segmentaion Model.
+        Args:
+            vit_dim (int): DINOv2 ViT dimension.
+            dino_backbone_name (str): DINOv2 model name.
+            swin_backbone_name (str): Swin Transformer model name.
+            decoder_type (str): decoder type ['segformer'].
+            num_classes (int): Number of output class.
+            emb_ch (int): Decoder`s embedding channel size.
+            dropout_ratio (float): Decoder`s dropout ratio.
+        Returns:
+            None: Initializes the ensemble model.
+        """
+        super().__init__(*args,**kwargs)
+        self.dino_extractor = DINOv2Extractor(torch.hub.load('facebookresearch/dinov2', dino_backbone_name))
+        self.swin_model = SwinTransformerSegmentationModel(
+            backbone_name=swin_backbone_name,
+            decoder_type=decoder_type,
+            num_classes=num_classes,
+            emb_ch=emb_ch,
+            dropout_ratio=dropout_ratio
+        )
+        self.ca = CrossAttentionFusion(
+            swin_dim=self.swin_model.backbone.feature_info.channels()[-1],
+            dino_dim=vit_dim,
+            out_dim=ca_emb_ch,
+            num_heads=4
+        )
+
+        self.decoder = self.swin_model.decoder
+
+    def forward(self, x:torch.Tensor):
+
+        input_size = x.shape[-2:]
+
+        dino_feat:torch.Tensor = self.dino_extractor(x)
+        swin_features:torch.Tensor = self.swin_model.backbone(x)
+        if swin_features[0].ndim == 4 and swin_features[0].shape[1] not in self.swin_model.backbone.feature_info.channels():
+            swin_features = [f.permute(0, 3, 1, 2).contiguous() for f in swin_features]
+        # Cross-Attention Fusion
+        fused_feat = self.ca(swin_features[-1], dino_feat['final'][:, 1:, :])  # DINO cls 토큰 제외
+        swin_features[-1] = fused_feat
+        logit_map = self.decoder(swin_features)
+        logit_map = F.interpolate(logit_map, size=input_size, mode='bilinear', align_corners=False)
+        
+
+
+
 # ==============================================================================
 
 if __name__ == "__main__":

@@ -95,6 +95,8 @@ class SwinTransformerSegmentationModel(nn.Module):
         in_chs = self.backbone.feature_info.channels()
         if decoder_type.lower() == 'segformer':
             self.decoder = SegFormerHead(in_chs=in_chs, num_cls=num_classes, emb_ch=emb_ch, dropout_ratio=dropout_ratio)
+        elif decoder_type.lower() == 'unet':
+            self.decoder = UNetDecoder(in_chs=in_chs, num_classes=num_classes, out_channels=emb_ch, dropout_ratio=dropout_ratio)
         else:
             raise ValueError(f"Unsupported decoder type: {decoder_type}")
         
@@ -127,3 +129,72 @@ class SwinTransformerSegmentationModel(nn.Module):
         logit_map = F.interpolate(logit_map, size=input_size, mode='bilinear', align_corners=False)
 
         return logit_map
+    
+
+class UNetDecoder(nn.Module):
+    def __init__(self, in_chs, out_channels=256, num_classes=1, *args, **kwargs):
+        super().__init__()
+
+        c1, c2, c3, c4 = in_chs  # Swin 4-stage channels
+
+        # 1×1 Conv to unify channel dimension
+        self.l1 = nn.Conv2d(c4, out_channels, 1)
+        self.l2 = nn.Conv2d(c3, out_channels, 1)
+        self.l3 = nn.Conv2d(c2, out_channels, 1)
+        self.l4 = nn.Conv2d(c1, out_channels, 1)
+
+        # UNet upsampling blocks
+        self.up1 = self._up_block(out_channels, out_channels)
+        self.up2 = self._up_block(out_channels, out_channels)
+        self.up3 = self._up_block(out_channels, out_channels)
+        self.up4 = self._up_block(out_channels, out_channels)
+
+        # Final output conv
+        self.out_conv = nn.Conv2d(out_channels, num_classes, kernel_size=1)
+
+    def _up_block(self, in_ch, out_ch):
+        # Simple conv block (Conv → BN → ReLU → Conv → BN → ReLU)
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, feats):
+        """
+        feats: List of 4 scales:
+            feats[0] : Stage1  (B, C1, H/4, H/4)
+            feats[1] : Stage2  (B, C2, H/8, H/8)
+            feats[2] : Stage3  (B, C3, H/16, H/16)
+            feats[3] : Stage4 fused (B, C4, H/32, H/32)
+        """
+        f1, f2, f3, f4 = feats
+
+        # Project all into same channel dim
+        f1 = self.l4(f1)
+        f2 = self.l3(f2)
+        f3 = self.l2(f3)
+        f4 = self.l1(f4)
+
+        # Decoder steps
+        x = F.interpolate(f4, scale_factor=2, mode='bilinear', align_corners=False)
+        x = x + f3
+        x = self.up1(x)
+
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = x + f2
+        x = self.up2(x)
+
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = x + f1
+        x = self.up3(x)
+
+        # Final upsample to original
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = self.up4(x)
+
+        out = self.out_conv(x)
+        return out

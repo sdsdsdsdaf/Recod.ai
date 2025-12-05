@@ -1064,6 +1064,7 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
         if backbone_params is not None:
             # Backbone/Encoder의 기울기 Norm 계산 (실제 클리핑 없이 노름 값만 얻음)
             encoder_norm = torch.nn.utils.clip_grad_norm_(backbone_params, max_norm=float("inf"))
+            # torch.nn.utils.clip_grad_norm_(backbone_params, max_norm=7.0)  
         else:
             encoder_norm = None
             print("[Norm] Backbone/Encoder 모듈을 찾을 수 없음.")
@@ -1073,6 +1074,7 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
         if decoder_params is not None:
             # Decoder의 기울기 Norm 계산
             decoder_norm = torch.nn.utils.clip_grad_norm_(decoder_params, max_norm=float("inf"))
+            # torch.nn.utils.clip_grad_norm_(decoder_params, max_norm=2.0)
         else:
             decoder_norm = None
             print("[Norm] Decoder 모듈을 찾을 수 없음.")

@@ -234,3 +234,154 @@ class SegFormerHead(nn.Module):
         return x
 
 # TODO UNET Decoder 구현 예정
+class UNetDecoder(nn.Module):
+    def __init__(self, in_chs, out_channels=256, num_classes=1, *args, **kwargs):
+        super().__init__()
+
+        c1, c2, c3, c4 = in_chs  # Swin 4-stage channels
+
+        # 1×1 Conv to unify channel dimension
+        self.l1 = nn.Conv2d(c4, out_channels, 1)
+        self.l2 = nn.Conv2d(c3, out_channels, 1)
+        self.l3 = nn.Conv2d(c2, out_channels, 1)
+        self.l4 = nn.Conv2d(c1, out_channels, 1)
+
+        # UNet upsampling blocks
+        self.up1 = self._up_block(out_channels, out_channels)
+        self.up2 = self._up_block(out_channels, out_channels)
+        self.up3 = self._up_block(out_channels, out_channels)
+        self.up4 = self._up_block(out_channels, out_channels)
+
+        # Final output conv
+        self.out_conv = nn.Conv2d(out_channels, num_classes, kernel_size=1)
+
+    def _up_block(self, in_ch, out_ch):
+        # Simple conv block (Conv → BN → ReLU → Conv → BN → ReLU)
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, feats):
+        """
+        feats: List of 4 scales:
+            feats[0] : Stage1  (B, C1, H/4, H/4)
+            feats[1] : Stage2  (B, C2, H/8, H/8)
+            feats[2] : Stage3  (B, C3, H/16, H/16)
+            feats[3] : Stage4 fused (B, C4, H/32, H/32)
+        """
+        f1, f2, f3, f4 = feats
+
+        # Project all into same channel dim
+        f1 = self.l4(f1)
+        f2 = self.l3(f2)
+        f3 = self.l2(f3)
+        f4 = self.l1(f4)
+
+        # Decoder steps
+        x = F.interpolate(f4, scale_factor=2, mode='bilinear', align_corners=False)
+        x = x + f3
+        x = self.up1(x)
+
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = x + f2
+        x = self.up2(x)
+
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = x + f1
+        x = self.up3(x)
+
+        # Final upsample to original
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = self.up4(x)
+
+        out = self.out_conv(x)
+        return out
+
+
+class ASPP(nn.Module):
+    def __init__(self, in_channels, out_channels=256, dilation_rates=(1, 6, 12, 18)):
+        super().__init__()
+
+        self.branches = nn.ModuleList()
+
+        # 1x1 conv
+        self.branches.append(
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            )
+        )
+
+        # dilated convs
+        for rate in dilation_rates:
+            self.branches.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels, kernel_size=3,
+                              padding=rate, dilation=rate, bias=False),
+                    nn.BatchNorm2d(out_channels),
+                    nn.ReLU(inplace=True)
+                )
+            )
+
+        # global pooling branch
+        self.global_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        self.project = nn.Sequential(
+            nn.Conv2d(out_channels * (len(dilation_rates) + 2), out_channels,
+                      kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1)
+        )
+
+    def forward(self, x):
+        h, w = x.shape[2:]
+
+        out = []
+
+        # atrous branches
+        for branch in self.branches:
+            out.append(branch(x))
+
+        # global branch
+        gp = self.global_pool(x)
+        gp = F.interpolate(gp, size=(h, w), mode="bilinear", align_corners=False)
+        out.append(gp)
+
+        out = torch.cat(out, dim=1)
+        return self.project(out)
+
+
+class DeepLabV3Decoder(nn.Module):
+    def __init__(self, encoder_channels, emb_ch, out_channels=1):
+        """
+        encoder_channels: 마지막 encoder stage의 output channel 수
+        out_channels: segmentation output channel (binary=1)
+        """
+        super().__init__()
+
+        self.aspp = ASPP(encoder_channels, out_channels=emb_ch)
+        
+        self.final = nn.Sequential(
+            nn.Conv2d(emb_ch, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, out_channels, 1)
+        )
+
+    def forward(self, x):
+        x = self.aspp(x)
+        x = self.final(x)
+        return x
