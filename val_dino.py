@@ -1,4 +1,6 @@
 import os
+
+from Utils.Augmentation import get_train_transform
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 import warnings
@@ -35,6 +37,7 @@ from time import time
 from transformers import get_cosine_schedule_with_warmup
 
 from Utils.Model import DINOv2SegmentationModel, SwinTransformerSegmentationModel as Swin
+from Utils.Model import SwinDinoEnsembleModel, UnetWithSelfCorr
 from Utils.Loss import FocalTverskyLoss
 from Utils.scheduler import cosine_with_min_lr
 from torch.utils.tensorboard import SummaryWriter
@@ -185,6 +188,7 @@ def cross_val_score(
     log = {}
     writer = None
 
+
     for fold, (train_idx, val_idx) in enumerate(kfold.split(dataset)):
         print(f"\nFOLD [{fold + 1}/{k}]...")
         if use_log:
@@ -213,6 +217,20 @@ def cross_val_score(
             raise ValueError("scheduler must be either get_cosine_schedule_with_warmup or cosine_with_min_lr")
 
         model = model_cls(**kwargs)
+        if model_cls.__name__ in [smp.FPN.__name__, smp.Unet.__name__, smp.DeepLabV3.__name__]:
+            
+            ckpt = torch.load("swinv2_base_22k_500k.pth", map_location=device)
+            sd = ckpt.get("model", ckpt)
+
+            try:
+                model.encoder.load_state_dict(sd, strict=True)
+                print("✔ strict=True 성공 (완벽 매칭)")
+            except RuntimeError:
+                msg = model.encoder.load_state_dict(sd, strict=False)
+                print("⚠ strict=False fallback")
+                print("missing:", len(msg.missing_keys))
+                print("unexpected:", len(msg.unexpected_keys))
+        
         if fold == 0: print(model)
         
         #TODO 후에 하드코딩아닌 함수인자로 받기
@@ -224,17 +242,21 @@ def cross_val_score(
             # A. SMP (Unet/DeepLab) 구조일 때
             if hasattr(model, 'encoder'):
                 params = model.encoder.parameters()
-            elif hasattr(model, 'backbone'):
+            elif hasattr(model, 'backbone'): 
                 params = model.backbone.parameters()
+            
+            if hasattr(model, 'decoder'):
+                pass
+            elif hasattr(model, 'segmentation_head'):
+                params_group.append({"params": model.segmentation_head.parameters(), "lr": lr})
+            elif hasattr(model, 'classification_head'):
+                params_group.append({"params": model.classification_head.parameters(), "lr": lr})
 
             params_group = [
                 {"params": params, "lr": lr*0.2},
                 {"params": model.decoder.parameters(), "lr": lr},
             ]
-            if hasattr(model, 'segmentation_head'):
-                params_group.append({"params": model.segmentation_head.parameters(), "lr": lr})
-            if hasattr(model, 'classification_head'):
-                params_group.append({"params": model.classification_head.parameters(), "lr": lr})
+            
 
         elif hasattr(model, 'backbone') and hasattr(model, 'decoder_low'):
             # B. DINOv2 (ViT) 기반 커스텀 구조일 때 (사용자님의 현재 모델)
@@ -244,6 +266,22 @@ def cross_val_score(
                 {"params": decoder_params, "lr": lr},                    # 디코더는 빠르게 학습
             ]
 
+        elif model_cls.__name__ == "SwinDinoEnsembleModel":
+            # C. Swin + DINOv2 앙상블 구조일 때
+            swin_params = list(model.swin_model.backbone.parameters())
+            decoder_params = list(model.swin_model.decoder.parameters())
+            params_group = [
+                {"params": swin_params, "lr": lr * 0.5},   # Swin은 매우 느리게 학습 (0.05)
+                {"params": decoder_params, "lr": lr},       # 디코더는 빠르게 학습
+            ]
+        elif model_cls.__name__ == "UnetWithSelfCorr":
+            # D. Unet with Self-Correlation 구조일 때
+            backbone_params = model.unet.encoder.parameters()
+            decoder_params = model.unet.decoder.parameters() if hasattr(model.unet, 'decoder') else None
+            params_group = [
+                {"params": backbone_params, "lr": lr * 0.2},  # 백본은 느리게 학습
+                {"params": decoder_params, "lr": lr},         # 디코더는 빠르게 학습
+            ]
         else:
             # C. 기타 구조이거나 파라미터 그룹 분리가 불필요할 때
             params_group = model.parameters()
@@ -326,7 +364,9 @@ if __name__ == "__main__":
     }
 
     # Preprocessing
-    IMG_SIZE = 224
+    IMG_SIZE = 192
+
+    """
     train_transform = A.Compose([
         # HDF5에는 storage_size(256)로 저장되어 있음 -> 여기서 224로 랜덤 크롭
         A.RandomCrop(IMG_SIZE, IMG_SIZE), 
@@ -334,6 +374,10 @@ if __name__ == "__main__":
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2()
     ])
+    """
+
+    train_transform = get_train_transform(img_size=IMG_SIZE)
+
     test_transform = A.Compose([
         # 테스트 때는 중앙 크롭 혹은 그냥 리사이즈 -> 슬라이딩 윈도우 방식 고려
         A.Resize(IMG_SIZE, IMG_SIZE),
@@ -358,15 +402,23 @@ if __name__ == "__main__":
     )
 
     BATCH_SIZE = 20
-    NUM_EPOCHS = 40
+    NUM_EPOCHS = 50
     NEW_LR_RATIO = 0.3 
-    FREEZE_EPOCH = 40
+    FREEZE_EPOCH = 50
     FREEZE_LAYER = None 
-    LR = 2.5e-4
+    LR = 1e-4
     WARMUP_RATIO = 0.3
     # POS_W = torch.tensor(1) # Resized
-    MODEL_CLS = Swin
-    POS_W_RATIO = 0.1
+    MODEL_CLS = UnetWithSelfCorr
+    base_model_config = {
+        'encoder_name': 'tu-swinv2_base_window12_192',
+        'encoder_weights': 'imagenet',
+        'in_channels': 3,
+        'classes': 1,
+        'activation': None
+    }
+
+    POS_W_RATIO = 0.12
     POS_W = compute_pos_weight(dataset=full_ds, h5_path="train_data_dino.h5") * POS_W_RATIO
     cls_loss = SoftBCEWithLogitsLoss(pos_weight=POS_W, smooth_factor=0.1)
     DECODER_TYPE = 'cnn_cbam' # [simple_mlp, unet_style, cnn_se, cnn_cbam] 
@@ -433,6 +485,7 @@ if __name__ == "__main__":
     scheduler_cls = cosine_with_min_lr
     scheduler_params = {
         "warmup_steps": None,       # 아래에서 계산됨
+
         "total_steps": None,        # 아래에서 계산됨
         "min_lr": 1e-6,
     }
@@ -445,7 +498,7 @@ if __name__ == "__main__":
 
     #ACK
     USE_LOG = True
-    RUN_NAME = "Swin_Transformer_In1k_Unet_emb_ch=256_min_lr=1e-6_bce_loss_Focal_Tversky_Loss-alpha=0.7"
+    RUN_NAME = f"SwinV2_unet_self_corr_weak_aug_lr{LR:.0e}_add_GN_add_x.detach"
 
 
     print_hyperparams()
@@ -462,22 +515,38 @@ if __name__ == "__main__":
         freeze_epoch=FREEZE_EPOCH, freeze_layer=FREEZE_LAYER, after_freeze_lr=NEW_LR_RATIO,  run_name=RUN_NAME, use_t=USE_T,
         new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma, train_transform=train_transform, test_transform=test_transform,
         
-        # Model Specific Args
-        backbone_name='swin_base_patch4_window7_224',
-        decoder_type='unet',
-        num_classes=1,
-        emb_ch=DECODER_EMB_CH,
-        dropout_ratio=DECODER_DROPOUT_RATIO,
+        base_unet_cls=smp.Unet, corr_level = 3,
+        corr_pool = 1,corr_topk = 1, temperature = 1, **base_model_config
+            
     )
 
     '''
-    encoder_name="efficientnet-b3", encoder_weights="imagenet", #모델 파라미터
-    in_channels=3, classes=1, activation=None, aux_params={
-        "classes": 1,           # 출력 클래스 개수
-        "pooling": "avg",       # global avg pooling
-        "dropout": 0.3,
-        "activation": None, # optional
-    }, decoder_type=DECODER_TYPE, vit_dim=VIT_DIM, num_classes=1, img_size=IMG_SIZE
+    # Swin
+    backbone_name='swin_base_patch4_window7_224',
+    decoder_type='unet',
+    num_classes=1,
+    emb_ch=DECODER_EMB_CH,
+    dropout_ratio=DECODER_DROPOUT_RATIO,
+
+    #Swin + DINOv2 Ensemble
+    # Model Specific Args
+    vit_dim=384,
+    dino_backbone_name='dinov2_vits14',
+    swin_backbone_name='swin_base_patch4_window7_224',
+    decoder_type='unet',
+    num_classes=1,
+    emb_ch=256,
+    ca_emb_ch=256,
+    dropout_ratio=0.1
+
+    SMP
+    , aux_params={
+            "classes": 1,           # 출력 클래스 개수
+            "pooling": "avg",       # global avg pooling
+            "dropout": 0.3,
+            "activation": None, # optional
+        }
+    , decoder_type=DECODER_TYPE, vit_dim=VIT_DIM, num_classes=1, img_size=IMG_SIZE
     '''
 
 

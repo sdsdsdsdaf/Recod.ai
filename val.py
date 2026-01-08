@@ -288,6 +288,8 @@ if __name__ == "__main__":
     MODEL_CLS = SMPDeepLabV3PlusWithNorm
     POS_W_RATIO = 0.25
     POS_W = compute_pos_weight(dataset=full_ds, h5_path="train_data.h5") * POS_W_RATIO
+
+    # TODO 일단 1로 고정
     cls_loss = SoftBCEWithLogitsLoss(pos_weight=POS_W, smooth_factor=0.02)
     """
     cls_loss = FocalLoss(

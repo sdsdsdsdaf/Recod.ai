@@ -27,6 +27,131 @@ def init_weights(m):
         init.constant_(m.weight, 1)
         init.constant_(m.bias, 0)
 
+def pick_gn_groups(C: int, max_groups: int = 8) -> int:
+    # Prefer groups so that channels per group is not too small
+    G = min(max_groups, C)
+    while C % G != 0:
+        G -= 1
+    return max(G, 1)
+
+class SelfCorr2d(nn.Module):
+
+    """
+    Compute a self-correlation (self-similarity) map from feature map.
+
+    Input:
+      feat: (B, C, H, W)
+    Output:
+      sim_map: (B, 1, H, W)
+
+    Notes:
+      - Uses cosine similarity between all spatial locations.
+      - To control compute/memory, optionally spatially downsample before correlation.
+      - topk=1 => max similarity; topk>1 => mean of top-k similarities.
+    """
+
+    def __init__(self, pool: int = 1, topk: int = 1, temperature: float = 1.0):
+        super().__init__()
+        self.pool = int(pool)
+        self.topk = int(topk)
+        self.temperature = float(temperature)
+
+
+    def forward(self, feat:torch.Tensor) -> torch.Tensor:
+        B, C, H, W = feat.size()
+        x = feat
+
+        if self.pool > 1:
+            # Spatial downsample to reduce N=H*W
+            x = F.avg_pool2d(feat, kernel_size=self.pool, stride=self.pool)
+        b, c, h, w = x.shape
+        n = h * w
+
+        x = F.normalize(x, dim=1).contiguous()  # (B, C, H, W) Channel 방향 정규화
+        x = x.view(b, c, n)  # (B, C, H*W)
+        x2 = x.transpose(1, 2).detach()  # (B, H*W, C)
+        sim = torch.bmm(x2, x) / max(self.temperature, 1e-6) # (B, H*W, H*W) 내적 계산
+
+        eye = torch.eye(n, device=feat.device, dtype=feat.dtype).unsqueeze(0)
+        sim = sim - 1e9 * eye
+
+        if self.topk <= 1:
+            s = sim.max(dim=-1).values  # (B, N)
+        else:
+            k = min(self.topk, n - 1)
+            s = sim.topk(k=k, dim=-1).values.mean(dim=-1)  # (B, N)
+
+        s = s.view(b, 1, h, w)  # (B,1,h,w)
+
+        # Upsample back if pooled
+        if self.pool > 1:
+            s = F.interpolate(s, size=(H, W), mode="bilinear", align_corners=False)
+
+        # Optional clamp (keeps it stable)
+        s = s.clamp(0, 1)
+        return s
+
+class UnetWithSelfCorr(nn.Module):
+    def __init__(
+        self,
+        base_unet_cls=smp.Unet,
+        corr_level: int = 2,     # which encoder feature to augment
+        corr_pool: int = 1,      # spatial pooling inside self-corr
+        corr_topk: int = 1,      # 1=max, >1 mean of top-k
+        temperature: float = 1.0,
+        **kwargs
+    ):
+        
+        super().__init__()
+        self.unet = base_unet_cls(**kwargs)
+        self.corr_level = corr_level
+        self.alpha = nn.Parameter(torch.tensor(-4.0))  # learnable scaling factor
+        self.max_gn_groups = 8
+
+        # We will discover channels at runtime on first forward if needed,
+        # but easiest is to build adapters lazily.
+        self.self_corr = SelfCorr2d(pool=corr_pool, topk=corr_topk, temperature=temperature)
+        self.adapters = nn.ModuleDict()  # keyed by level -> 1x1 conv
+
+    def _get_adapter(self, level: int, channels: int, device, dtype):
+        key = str(level)
+        if key not in self.adapters:
+            # Adapter: (C+1) -> C
+            conv = nn.Conv2d(channels + 1, channels, kernel_size=1, bias=True).to(device=device, dtype=dtype)
+            with torch.no_grad():
+                conv.weight.zero_()
+                conv.bias.zero_()
+
+                # Identity mapping for Fm channels: out[c] = in[c]
+                # weight shape: (out_channels=C, in_channels=C+1, 1, 1)
+                conv.weight[:, :channels, 0, 0] = torch.eye(channels, device=conv.weight.device, dtype=conv.weight.dtype)
+    
+            norm = nn.GroupNorm(num_groups=pick_gn_groups(channels, self.max_gn_groups), num_channels=channels).to(device=device, dtype=dtype)
+            adapter = nn.Sequential(conv, norm)
+            self.adapters[key] = adapter
+        return self.adapters[key]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Encoder features: list of tensors with increasing depth
+        features = self.unet.encoder(x)
+
+        # Safety check
+        if not (0 <= self.corr_level < len(features)):
+            raise ValueError(f"corr_level={self.corr_level} out of range. "
+                             f"Available levels: 0..{len(features)-1}")
+
+        Fm:torch.Tensor = features[self.corr_level]            # (B,C,h,w)
+        S = self.self_corr(Fm)                    # (B,1,h,w)
+        adapter = self._get_adapter(self.corr_level, Fm.shape[1], device=Fm.device, dtype=Fm.dtype)
+
+        Fm2 = Fm + torch.sigmoid(self.alpha) * adapter(torch.cat([Fm, S], dim=1))  # (B,C,h,w)
+        features[self.corr_level] = Fm2
+
+        # Decoder expects features unpacked
+        dec = self.unet.decoder(features)
+        logits = self.unet.segmentation_head(dec)
+        return logits
+
 class FeatureHook:
     def __init__(self, name):
         self.name = name
@@ -395,12 +520,17 @@ class SwinDinoEnsembleModel(nn.Module):
         )
 
         self.decoder = self.swin_model.decoder
+        self.dino_extractor.eval()  # DINOv2는 고정
+        for p in self.dino_extractor.parameters():
+            p.requires_grad = False
+        
+        print("Ensemble Model initialized.")
 
     def forward(self, x:torch.Tensor):
 
         input_size = x.shape[-2:]
 
-        dino_feat:torch.Tensor = self.dino_extractor(x)
+        dino_feat:torch.Tensor = self.dino_extractor.forward_features(x)
         swin_features:torch.Tensor = self.swin_model.backbone(x)
         if swin_features[0].ndim == 4 and swin_features[0].shape[1] not in self.swin_model.backbone.feature_info.channels():
             swin_features = [f.permute(0, 3, 1, 2).contiguous() for f in swin_features]
@@ -409,14 +539,16 @@ class SwinDinoEnsembleModel(nn.Module):
         swin_features[-1] = fused_feat
         logit_map = self.decoder(swin_features)
         logit_map = F.interpolate(logit_map, size=input_size, mode='bilinear', align_corners=False)
-        
 
+        return logit_map
+        
 
 
 # ==============================================================================
 
 if __name__ == "__main__":
 
+    """
     model = SwinTransformerSegmentationModel(
         backbone_name='swin_base_patch4_window7_224',
         decoder_type='segformer',
@@ -424,8 +556,22 @@ if __name__ == "__main__":
         emb_ch=256,
         dropout_ratio=0.1
     )
-    model.eval()
+    """
 
-    dummy_input = torch.randn(2, 3, 224, 224)  # 배치 크기 2, 이미지 크기 224x224
+    model = SwinDinoEnsembleModel(
+        vit_dim=384,
+        dino_backbone_name='dinov2_vits14',
+        swin_backbone_name='swin_base_patch4_window7_224',
+        decoder_type='segformer',
+        num_classes=1,
+        emb_ch=256,
+        ca_emb_ch=256,
+        dropout_ratio=0.1
+    )
+
+    model.eval()
+    model.cuda()
+
+    dummy_input = torch.randn(2, 3, 224, 224).cuda()  # 배치 크기 2, 이미지 크기 224x224
     output = model(dummy_input)
     print("Output shape:", output.shape)  # 예상 출력: (2, 1, 224, 224)

@@ -3,6 +3,7 @@ from time import time
 from typing import Optional, Union
 
 import numba
+import torch.nn as nn
 import numpy as np
 from numba import types
 import numpy.typing as npt
@@ -678,7 +679,7 @@ def train(
                 masks = torch.stack(zero_masks_list + nonzero_masks_list).to(device)
 
                 # ── ③ 모델 예측 ──
-                if hasattr(model, 'classification_head'):
+                if getattr(model, 'classification_head', None) is not None:
                     preds, _ = model(imgs)
                 else:   
                     preds = model(imgs)
@@ -842,7 +843,7 @@ def evaluate(
         total_loss += loss.item()
         cls_total += cls_loss.item()
         dice_total += dice_loss.item()
-        img_total += img_loss.item() if hasattr(model, 'classification_head') else 0
+        img_total += img_loss.item() if getattr(model, 'classification_head', None) is not None else 0
 
 
 
@@ -940,9 +941,14 @@ def mask_path2img_path(mask_path, is_forged):
 
 
 
-def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=1.0, scaler: Optional[torch.amp.GradScaler] = None, log_file=None, use_t=False, freeze_epoch=10, writer=None) -> dict[str, float]:
+def train_one_epoch(model:nn.Module, epoch, train_loader, optimizer, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=1.0, scaler: Optional[torch.amp.GradScaler] = None, log_file=None, use_t=False, freeze_epoch=10, writer=None) -> dict[str, float]:
 
-    model.train()
+    
+    if hasattr(model, 'swin_model'):
+        model.swin_model.train()
+    else:
+        model.train()
+
     total_loss = 0
     bce_total = 0
     dice_total = 0
@@ -1049,7 +1055,17 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
             backbone_params = model.encoder.parameters()
             decoder_params = model.decoder.parameters() if hasattr(model, 'decoder') else None
             encoder_norm_target_name = 'encoder'
-            
+        
+        # Unet Correlated 모델
+        elif getattr(model, 'unet', None) is not None:
+            backbone_params = model.unet.encoder.parameters()
+            decoder_params = model.unet.decoder.parameters() if hasattr(model.unet, 'decoder') else None
+            encoder_norm_target_name = 'unet_encoder'
+
+        elif getattr(model.swin_model, 'backbone', None) is not None:
+            backbone_params = model.swin_model.backbone.parameters()
+            decoder_params = model.decoder.parameters() if hasattr(model.swin_model, 'decoder') else None
+            encoder_norm_target_name = 'swin_backbone'
         else:
             # 예외 처리: 대상 모듈을 찾을 수 없을 때
             backbone_params = None
@@ -1133,7 +1149,7 @@ def train_one_epoch(model, epoch, train_loader, optimizer, device:Union[torch.de
     }
 
 
-def predict(model, test_path, device, test_path_file_list=None, img_size=128, max_size=None, interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, low_conf_max_prob = 0.06, low_viz_thr = 0.04, low_conf_min_pixel = 128, scaler: Optional[torch.amp.GradScaler] = None, train_transform=None, test_transform=None) -> dict[str, str]:
+def predict(model:nn.Module, test_path, device, test_path_file_list=None, img_size=128, max_size=None, interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, low_conf_max_prob = 0.06, low_viz_thr = 0.04, low_conf_min_pixel = 128, scaler: Optional[torch.amp.GradScaler] = None, train_transform=None, test_transform=None) -> dict[str, str]:
 
     """
     Return RLE string

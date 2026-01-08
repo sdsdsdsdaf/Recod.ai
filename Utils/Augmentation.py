@@ -90,7 +90,7 @@ def get_forge_augmentation(version="weak", config=None):
             A.VerticalFlip(p=cfg["vflip_p"]),
 
             A.RandomResizedCrop(
-                height=img_size, width=img_size,
+                size=(img_size, img_size),
                 scale=cfg["rrc_scale"],
                 ratio=cfg["rrc_ratio"],
                 p=cfg["rrc_p"]
@@ -125,11 +125,13 @@ def get_forge_augmentation(version="weak", config=None):
     elif version == "strong":
         aug_list = [
 
-            A.Flip(p=cfg["flip_p"]),
+            A.HorizontalFlip(p=cfg["flip_p"]),
+            A.VerticalFlip(p=cfg["vflip_p"]),
+
             A.RandomRotate90(p=cfg["rotate90_p"]),
 
             A.RandomResizedCrop(
-                height=img_size, width=img_size,
+                size=(img_size, img_size),
                 scale=cfg["rrc_scale"],
                 ratio=cfg["rrc_ratio"],
                 p=cfg["rrc_p"]

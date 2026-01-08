@@ -3,7 +3,6 @@ from torch.utils.data import Dataset
 import os, cv2, torch
 import numpy as np
 from tqdm.auto import tqdm
-from Utils.utils import preprocessing
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -409,3 +408,37 @@ class HybridDataset(Dataset):
 '''
     
 
+if __name__ == "__main__":
+    # Test the HybridDataset
+    train_transform = A.Compose([
+        A.Resize(256, 256),
+        A.RandomCrop(224, 224),
+        A.HorizontalFlip(),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+    test_transform = A.Compose([
+        A.Resize(224, 224),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+    dataset = HybridDataset(
+        h5_path="train_data_dino.h5",
+        authentic_path="data/authentic",
+        forged_path="data/forged",
+        masks_path="data/masks",
+        img_size=224,
+        is_train=True,
+        preload=True,
+        verbose=True,
+        train_transform=train_transform,
+        test_transform=test_transform,
+        train_sample_num=100,
+        test_sample_num=20
+    )
+
+    print(f"Dataset length: {len(dataset)}")
+    img, mask, path, is_forged = dataset[0]
+    print(f"Image shape: {img.shape}, Mask shape: {mask.shape}, Path: {path}, Is Forged: {is_forged}")
