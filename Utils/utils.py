@@ -527,7 +527,6 @@ def freeze_encoder_after_epoch(
 
 
 def compute_pos_weight(
-        
     dataset=None,
     masks_path=None,
     authentic_path=None,
@@ -539,86 +538,93 @@ def compute_pos_weight(
     interpolation=cv2.INTER_NEAREST,
 ):
     """
-    Compute pos_weight for BCE loss based on forged pixel ratio.
-
-    Args:
-        dataset: HybridDataset instance (optional)
-        masks_path: path to train_masks directory
-        h5_path: path to HDF5 file
-        img_size: target resize (for 'resized' mode)
-        mode: 'resized' or 'original'
-        authentic_included: if True, counts authentic (no mask) images as all-zero masks
-
     Returns:
-        torch.Tensor: scalar pos_weight
+        torch.Tensor (scalar): pos_weight = neg/pos  (BCEWithLogitsLoss convention)
     """
     forged_pixels = 0
     total_pixels = 0
     processed = 0
-    try:
-        # ✅ Case 1: HDF5 (resized mask 기준)
-        if h5_path and os.path.exists(h5_path) and mode == "resized":
-            print(f"📊 Loading resized mask stats from HDF5: {h5_path}")
-            with h5py.File(h5_path, "r") as h5f:
-                masks = h5f["masks"][:]
-                forged_pixels = masks.sum()
-                total_pixels = np.prod(masks.shape)
-                processed = masks.shape[0]
-        
-        # ✅ Case 2: Raw mask 폴더 기준
-        elif masks_path and os.path.exists(masks_path):
-            print(f"📊 Scanning {'resized' if mode=='resized' else 'original'} masks in: {masks_path}")
-            mask_files = [f"{f.split('.')[0]}.npy" for f in (os.listdir(authentic_path) + os.listdir(forgded_path)) if f.endswith(('.png', '.jpg', '.jpeg', ))]
-            print(f"🗂 Found {len(mask_files)} mask files.")
-            print("[DEBUG] First 5 mask files:", mask_files[:5])
-            for f in tqdm(mask_files, leave=False):
-                mask_path = os.path.join(masks_path, f)
-                try:
-                    mask = np.load(mask_path)
-                    if mask.ndim == 3:
-                        mask = mask.max(axis=0) if mask.shape[0] <= 10 else mask.max(axis=-1)
-                    if mode == "resized":
-                        mask = cv2.resize(mask.astype(np.uint8), (img_size, img_size), interpolation=interpolation)
-                    mask = (mask > 0).astype(np.uint8)
-                except Exception:
-                    # 🚨 mask 파일 깨졌거나 누락된 경우
-                    mask = np.zeros((img_size, img_size), dtype=np.uint8)
 
-                forged_pixels += mask.sum()
-                total_pixels += mask.size
-                processed += 1
-
-            # ✅ authentic (mask 없는 이미지)를 0-mask로 추가
-            if authentic_included and dataset is not None:
-                missing = len(dataset.samples) - processed
-                if missing > 0:
-                    total_pixels += missing * (img_size ** 2)
-                    print(f"📦 Added {missing} authentic samples as 0-masks")
-
-        else:
-            raise ValueError("You must provide either h5_path or masks_path.")
-    except:
+    # -----------------------
+    # Case 1) HDF5
+    # -----------------------
+    if h5_path and os.path.exists(h5_path):
+        print(f"📊 Loading mask stats from HDF5: {h5_path}")
         with h5py.File(h5_path, "r") as h5f:
-            n = int(h5f.attrs.get("num_samples", len(h5f.keys())))
-            forged_pixels = 0
-            total_pixels = 0
+            # ✅ (A) flat dataset format: /masks exists
+            if "masks" in h5f:
+                masks = h5f["masks"][...]
+                forged_pixels = int(masks.sum())
+                total_pixels = int(masks.size)
+                processed = int(masks.shape[0]) if masks.ndim >= 3 else 1
 
-            for i in range(n):
-                m = h5f[str(i)]["masks"][...]  # <-- group-based
-                forged_pixels += int(m.sum())
-                total_pixels += int(m.size)
+            # ✅ (B) group-per-sample format: /0/masks, /1/masks, ...
+            else:
+                n = int(h5f.attrs.get("num_samples", len(h5f.keys())))
+                for i in range(n):
+                    m = h5f[str(i)]["masks"][...]
+                    forged_pixels += int(m.sum())
+                    total_pixels += int(m.size)
+                processed = n
 
-        # BCEWithLogitsLoss pos_weight = neg/pos
         pos = max(1, forged_pixels)
         neg = max(1, total_pixels - forged_pixels)
-        return neg / pos
+        pos_weight = neg / pos
 
-    ratio = forged_pixels / (total_pixels + 1e-8)
-    pos_weight = (1 - ratio) / (ratio + 1e-8)
+        ratio = forged_pixels / (total_pixels + 1e-8)
+        print(f"\n📈 Forged pixel ratio: {ratio:.8f}")
+        print(f"⚖️ pos_weight = {pos_weight:.2f}  (H5, total={processed} samples)")
+        return torch.tensor(pos_weight, dtype=torch.float32)
 
-    print(f"\n📈 Forged pixel ratio: {ratio:.8f}")
-    print(f"⚖️ pos_weight = {pos_weight:.2f}  (mode={mode}, total={processed} samples)")
-    return torch.tensor(pos_weight, dtype=torch.float32)
+    # -----------------------
+    # Case 2) Raw mask folder
+    # -----------------------
+    if masks_path and os.path.exists(masks_path):
+        print(f"📊 Scanning {'resized' if mode=='resized' else 'original'} masks in: {masks_path}")
+
+        img_files = []
+        if authentic_path and os.path.exists(authentic_path):
+            img_files += [f for f in os.listdir(authentic_path) if f.lower().endswith(('.png','.jpg','.jpeg'))]
+        if forgded_path and os.path.exists(forgded_path):
+            img_files += [f for f in os.listdir(forgded_path) if f.lower().endswith(('.png','.jpg','.jpeg'))]
+
+        mask_files = [f"{os.path.splitext(f)[0]}.npy" for f in img_files]
+        print(f"🗂 Found {len(mask_files)} mask files.")
+
+        for f in tqdm(mask_files, leave=False):
+            mp = os.path.join(masks_path, f)
+            if os.path.exists(mp):
+                mask = np.load(mp)
+                if mask.ndim == 3:
+                    mask = mask.max(axis=0) if mask.shape[0] <= 10 else mask.max(axis=-1)
+                mask = (mask > 0).astype(np.uint8)
+            else:
+                mask = np.zeros((img_size, img_size), dtype=np.uint8)
+
+            if mode == "resized":
+                mask = cv2.resize(mask, (img_size, img_size), interpolation=interpolation)
+
+            forged_pixels += int(mask.sum())
+            total_pixels += int(mask.size)
+            processed += 1
+
+        # optional: count authentic as zero masks
+        if authentic_included and dataset is not None:
+            missing = len(dataset.samples) - processed
+            if missing > 0:
+                total_pixels += missing * (img_size ** 2)
+                print(f"📦 Added {missing} authentic samples as 0-masks")
+
+        pos = max(1, forged_pixels)
+        neg = max(1, total_pixels - forged_pixels)
+        pos_weight = neg / pos
+
+        ratio = forged_pixels / (total_pixels + 1e-8)
+        print(f"\n📈 Forged pixel ratio: {ratio:.8f}")
+        print(f"⚖️ pos_weight = {pos_weight:.2f}  (raw masks, total={processed} samples)")
+        return torch.tensor(pos_weight, dtype=torch.float32)
+
+    raise ValueError("You must provide a valid h5_path or masks_path.")
 
 
 

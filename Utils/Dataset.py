@@ -279,7 +279,7 @@ class HybridCropDataset(Dataset):
             for i in tqdm(range(n)):
                 grp = h5f[str(i)]
                 img = grp["img"][...]
-                mask = grp["mask"][...]
+                mask = grp["masks"][...]
 
                 img_size["min_h"] = min(img_size["min_h"], img.shape[0])
                 img_size["min_w"] = min(img_size["min_w"], img.shape[1])

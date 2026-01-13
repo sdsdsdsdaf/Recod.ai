@@ -331,6 +331,7 @@ if __name__ == "__main__":
 
     import os
     from time import time
+    import kagglehub
 
     set_seed()
 
@@ -338,7 +339,9 @@ if __name__ == "__main__":
     import os
     import platform
 
-    COMP_DIR = r"C:\Users\user\.cache\kagglehub\competitions\recodai-luc-scientific-image-forgery-detection"
+    kagglehub.login()
+    COMP_DIR = kagglehub.competition_download('recodai-luc-scientific-image-forgery-detection')
+    #  COMP_DIR = r"C:\Users\user\.cache\kagglehub\competitions\recodai-luc-scientific-image-forgery-detection"
     TEST_DIR = os.path.join(COMP_DIR, "test_images")
     TRAIN_DIR = os.path.join(COMP_DIR, "train_images")
     MODEL_PATH = os.path.join(r"C:\Users\user\.cache\kagglehub\models\aikim12345689\smp-unet\PyTorch\smp2\4", "SMP_UNet.pth")
@@ -424,7 +427,7 @@ if __name__ == "__main__":
     }
 
     POS_W_RATIO = 0.12
-    POS_W = compute_pos_weight(dataset=full_ds, h5_path="train_data_dino.h5") * POS_W_RATIO
+    POS_W = compute_pos_weight(dataset=full_ds, h5_path="train_data_crop_384px.h5") * POS_W_RATIO
     cls_loss = SoftBCEWithLogitsLoss(pos_weight=POS_W, smooth_factor=0.1)
     DECODER_TYPE = 'cnn_cbam' # [simple_mlp, unet_style, cnn_se, cnn_cbam] 
     VIT_DIM = 384
