@@ -344,7 +344,7 @@ if __name__ == "__main__":
     MODEL_PATH = os.path.join(r"C:\Users\user\.cache\kagglehub\models\aikim12345689\smp-unet\PyTorch\smp2\4", "SMP_UNet.pth")
 
     # Output
-    OUT_DIR = "/kaggle/working"
+    OUT_DIR = "working"
     os.makedirs(OUT_DIR, exist_ok=True)
     SUB_PATH = os.path.join(OUT_DIR, "submission.csv")
 
