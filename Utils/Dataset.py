@@ -259,7 +259,7 @@ class HybridCropDataset(Dataset):
 
                 grp = h5f.create_group(str(i))
                 grp.create_dataset("img", data=img, dtype="uint8", compression="lzf")
-                grp.create_dataset("mask", data=mask, dtype="uint8", compression="lzf")
+                grp.create_dataset("masks", data=mask, dtype="uint8", compression="lzf")
                 grp.create_dataset("is_forged", data=np.uint8(is_forged))
                 grp.create_dataset("path", data=np.string_(mask_path))
 
@@ -300,7 +300,7 @@ class HybridCropDataset(Dataset):
         with h5py.File(self.h5_path, "r") as h5f:
             grp = h5f[str(idx)]
             img = grp["img"][...]
-            mask = grp["mask"][...]
+            mask = grp["masks"][...]
             is_forged = int(grp["is_forged"][()])
             path = grp["path"][()]
             if isinstance(path, bytes):
@@ -710,20 +710,22 @@ if __name__ == "__main__":
         ToTensorV2(),
     ])
 
-    dataset = HybridDataset(
-        h5_path="train_data_dino.h5",
-        authentic_path="data/authentic",
-        forged_path="data/forged",
-        masks_path="data/masks",
-        img_size=224,
+    dataset = HybridCropDataset(
+        f"train_data_crop_{384}px.h5",
+        "data/authentic",
+        "data/forged",
+        "data/masks",
+        img_size=384,
         is_train=True,
         preload=True,
-        verbose=True,
+        verbose=True,   
         train_transform=train_transform,
         test_transform=test_transform,
         train_sample_num=100,
-        test_sample_num=20
+        test_sample_num=20,
+        pad_mode='constant'
     )
+
 
     print(f"Dataset length: {len(dataset)}")
     img, mask, path, is_forged = dataset[0]

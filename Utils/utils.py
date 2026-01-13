@@ -10,7 +10,7 @@ import numpy as np
 from numba import types
 import numpy.typing as npt
 import pandas as pd
-import scipy.optimize
+import scipy.optimize   
 import cv2
 import torch
 import h5py
@@ -63,7 +63,7 @@ def postprocessing(proba_map:np.ndarray, original_size:tuple[int, int], threshol
 
     #후에 bilinear사용 고려
     proba_map = cv2.resize(proba_map, (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST) # (W, H)
-    mask_pred = (proba_map > threshold).astype(np.uint8)
+    mask_pred = (proba_map > threshold).astype(np.uint8)P
 
     #PostProcessing
     kernel = np.ones((3,3), np.uint8)
@@ -555,48 +555,63 @@ def compute_pos_weight(
     forged_pixels = 0
     total_pixels = 0
     processed = 0
+    try:
+        # ✅ Case 1: HDF5 (resized mask 기준)
+        if h5_path and os.path.exists(h5_path) and mode == "resized":
+            print(f"📊 Loading resized mask stats from HDF5: {h5_path}")
+            with h5py.File(h5_path, "r") as h5f:
+                masks = h5f["masks"][:]
+                forged_pixels = masks.sum()
+                total_pixels = np.prod(masks.shape)
+                processed = masks.shape[0]
+        
+        # ✅ Case 2: Raw mask 폴더 기준
+        elif masks_path and os.path.exists(masks_path):
+            print(f"📊 Scanning {'resized' if mode=='resized' else 'original'} masks in: {masks_path}")
+            mask_files = [f"{f.split('.')[0]}.npy" for f in (os.listdir(authentic_path) + os.listdir(forgded_path)) if f.endswith(('.png', '.jpg', '.jpeg', ))]
+            print(f"🗂 Found {len(mask_files)} mask files.")
+            print("[DEBUG] First 5 mask files:", mask_files[:5])
+            for f in tqdm(mask_files, leave=False):
+                mask_path = os.path.join(masks_path, f)
+                try:
+                    mask = np.load(mask_path)
+                    if mask.ndim == 3:
+                        mask = mask.max(axis=0) if mask.shape[0] <= 10 else mask.max(axis=-1)
+                    if mode == "resized":
+                        mask = cv2.resize(mask.astype(np.uint8), (img_size, img_size), interpolation=interpolation)
+                    mask = (mask > 0).astype(np.uint8)
+                except Exception:
+                    # 🚨 mask 파일 깨졌거나 누락된 경우
+                    mask = np.zeros((img_size, img_size), dtype=np.uint8)
 
-    # ✅ Case 1: HDF5 (resized mask 기준)
-    if h5_path and os.path.exists(h5_path) and mode == "resized":
-        print(f"📊 Loading resized mask stats from HDF5: {h5_path}")
+                forged_pixels += mask.sum()
+                total_pixels += mask.size
+                processed += 1
+
+            # ✅ authentic (mask 없는 이미지)를 0-mask로 추가
+            if authentic_included and dataset is not None:
+                missing = len(dataset.samples) - processed
+                if missing > 0:
+                    total_pixels += missing * (img_size ** 2)
+                    print(f"📦 Added {missing} authentic samples as 0-masks")
+
+        else:
+            raise ValueError("You must provide either h5_path or masks_path.")
+    except:
         with h5py.File(h5_path, "r") as h5f:
-            masks = h5f["masks"][:]
-            forged_pixels = masks.sum()
-            total_pixels = np.prod(masks.shape)
-            processed = masks.shape[0]
-    
-    # ✅ Case 2: Raw mask 폴더 기준
-    elif masks_path and os.path.exists(masks_path):
-        print(f"📊 Scanning {'resized' if mode=='resized' else 'original'} masks in: {masks_path}")
-        mask_files = [f"{f.split('.')[0]}.npy" for f in (os.listdir(authentic_path) + os.listdir(forgded_path)) if f.endswith(('.png', '.jpg', '.jpeg', ))]
-        print(f"🗂 Found {len(mask_files)} mask files.")
-        print("[DEBUG] First 5 mask files:", mask_files[:5])
-        for f in tqdm(mask_files, leave=False):
-            mask_path = os.path.join(masks_path, f)
-            try:
-                mask = np.load(mask_path)
-                if mask.ndim == 3:
-                    mask = mask.max(axis=0) if mask.shape[0] <= 10 else mask.max(axis=-1)
-                if mode == "resized":
-                    mask = cv2.resize(mask.astype(np.uint8), (img_size, img_size), interpolation=interpolation)
-                mask = (mask > 0).astype(np.uint8)
-            except Exception:
-                # 🚨 mask 파일 깨졌거나 누락된 경우
-                mask = np.zeros((img_size, img_size), dtype=np.uint8)
+            n = int(h5f.attrs.get("num_samples", len(h5f.keys())))
+            forged_pixels = 0
+            total_pixels = 0
 
-            forged_pixels += mask.sum()
-            total_pixels += mask.size
-            processed += 1
+            for i in range(n):
+                m = h5f[str(i)]["masks"][...]  # <-- group-based
+                forged_pixels += int(m.sum())
+                total_pixels += int(m.size)
 
-        # ✅ authentic (mask 없는 이미지)를 0-mask로 추가
-        if authentic_included and dataset is not None:
-            missing = len(dataset.samples) - processed
-            if missing > 0:
-                total_pixels += missing * (img_size ** 2)
-                print(f"📦 Added {missing} authentic samples as 0-masks")
-
-    else:
-        raise ValueError("You must provide either h5_path or masks_path.")
+        # BCEWithLogitsLoss pos_weight = neg/pos
+        pos = max(1, forged_pixels)
+        neg = max(1, total_pixels - forged_pixels)
+        return neg / pos
 
     ratio = forged_pixels / (total_pixels + 1e-8)
     pos_weight = (1 - ratio) / (ratio + 1e-8)
