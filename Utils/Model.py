@@ -91,10 +91,10 @@ class SelfCorr2d(nn.Module):
         s = s.clamp(0, 1)
         return s
 
-class UnetWithSelfCorr(nn.Module):
+class SMPWithSelfCorr(nn.Module):
     def __init__(
         self,
-        base_unet_cls=smp.Unet,
+        base_smp_cls=smp.Unet,
         corr_level: int = 2,     # which encoder feature to augment
         corr_pool: int = 1,      # spatial pooling inside self-corr
         corr_topk: int = 1,      # 1=max, >1 mean of top-k
@@ -103,7 +103,7 @@ class UnetWithSelfCorr(nn.Module):
     ):
         
         super().__init__()
-        self.unet = base_unet_cls(**kwargs)
+        self.smp = base_smp_cls(**kwargs)
         self.corr_level = corr_level
         self.alpha = nn.Parameter(torch.tensor(-4.0))  # learnable scaling factor
         self.max_gn_groups = 8
@@ -133,7 +133,7 @@ class UnetWithSelfCorr(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Encoder features: list of tensors with increasing depth
-        features = self.unet.encoder(x)
+        features = self.smp.encoder(x)
 
         # Safety check
         if not (0 <= self.corr_level < len(features)):
@@ -148,8 +148,8 @@ class UnetWithSelfCorr(nn.Module):
         features[self.corr_level] = Fm2
 
         # Decoder expects features unpacked
-        dec = self.unet.decoder(features)
-        logits = self.unet.segmentation_head(dec)
+        dec = self.smp.decoder(features)
+        logits = self.smp.segmentation_head(dec)
         return logits
 
 class FeatureHook:

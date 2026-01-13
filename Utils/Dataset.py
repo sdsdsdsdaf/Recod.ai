@@ -6,6 +6,85 @@ from tqdm.auto import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
+def pad_to_min(img, mask, min_size, pad_mode="reflect"):
+    """
+    Pad image/mask so that H,W >= min_size.
+    pad_mode: "reflect" | "replicate" | "zero"
+    """
+    H, W = img.shape[:2]
+    pad_h = max(0, min_size - H)
+    pad_w = max(0, min_size - W)
+    if pad_h == 0 and pad_w == 0:
+        return img, mask
+
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+
+    if pad_mode == "reflect":
+        img_border = cv2.BORDER_REFLECT_101
+        img_p = cv2.copyMakeBorder(img, top, bottom, left, right, img_border)
+    elif pad_mode == "replicate":
+        img_border = cv2.BORDER_REPLICATE
+        img_p = cv2.copyMakeBorder(img, top, bottom, left, right, img_border)
+    elif pad_mode == "constant" or pad_mode == "zero":
+        img_p = cv2.copyMakeBorder(img, top, bottom, left, right,
+                                   borderType=cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    else:
+        raise ValueError(f"Unknown pad_mode: {pad_mode}")
+
+    # mask는 항상 0-padding이 안전
+    mask_p = cv2.copyMakeBorder(mask, top, bottom, left, right,
+                                borderType=cv2.BORDER_CONSTANT, value=0)
+    return img_p, mask_p
+
+
+def sample_crop_xy(mask, patch_size, pos_center_prob=0.7):
+    """
+    Choose top-left crop coord (x0,y0).
+    - If mask has positives and rand < pos_center_prob: ensure a positive pixel is inside the crop.
+    - Else: random crop.
+    """
+    H, W = mask.shape
+    s = patch_size
+    max_y = H - s
+    max_x = W - s
+
+    # pad_to_min should guarantee max_x/max_y >= 0
+    if max_y < 0 or max_x < 0:
+        return 0, 0
+
+    if mask.sum() == 0 or np.random.rand() > pos_center_prob:
+        y0 = np.random.randint(0, max_y + 1) if max_y > 0 else 0
+        x0 = np.random.randint(0, max_x + 1) if max_x > 0 else 0
+        return x0, y0
+
+    ys, xs = np.where(mask > 0)
+    k = np.random.randint(0, len(xs))
+    cx, cy = int(xs[k]), int(ys[k])
+
+    x0_min = max(0, cx - s + 1)
+    x0_max = min(cx, max_x)
+    y0_min = max(0, cy - s + 1)
+    y0_max = min(cy, max_y)
+
+    x0 = np.random.randint(x0_min, x0_max + 1) if x0_max >= x0_min else max(0, min(cx, max_x))
+    y0 = np.random.randint(y0_min, y0_max + 1) if y0_max >= y0_min else max(0, min(cy, max_y))
+    return x0, y0
+
+
+class PatchSizeScheduler:
+    def __init__(self, sizes, probs):
+        assert len(sizes) == len(probs)
+        self.sizes = list(map(int, sizes))
+        p = np.array(probs, dtype=np.float64)
+        self.probs = p / p.sum()
+
+    def sample(self):
+        return int(np.random.choice(self.sizes, p=self.probs))
+
+
 class FastDataset(Dataset):
     def __init__(self, authentic_path, forged_path, masks_path,
                 img_size=128, is_train=True, train_sample_num=None, test_sample_num=None, interpolation=cv2.INTER_NEAREST):
@@ -59,7 +138,214 @@ class FastDataset(Dataset):
 
         mask = torch.from_numpy(mask).unsqueeze(0)
         return img, mask
-    
+
+class HybridCropDataset(Dataset):
+    """
+    Hybrid lazy/full-memory dataset (HDF5 유지) + patch crop in __getitem__.
+    - HDF5 format: group-per-sample (str(idx)/img, mask, is_forged, path)
+    - No resize. Only pad + crop.
+    - Supports preload (RAM)
+    - __init__ signature matches HybridDataset
+    """
+
+    def __init__(self, h5_path: str,
+                 authentic_path: str,
+                 forged_path: str,
+                 masks_path: str,
+                 img_size=224,        # patch_size (가변 가능)
+                 storage_size=256,    # (호환용 파라미터) 사용 안 함 / 무시 가능
+                 is_train=True,
+                 preload=False,
+                 verbose=False,
+                 train_transform: A.Compose=None,
+                 test_transform: A.Compose=None,
+                 train_sample_num=None,
+                 test_sample_num=None,
+                 # ---- 추가 옵션 (기본값 넣어도 HybridDataset 호환) ----
+                 patch_scheduler: PatchSizeScheduler=None,
+                 pos_center_prob: float=0.7,
+                 pad_mode: str="reflect",   # "reflect" | "replicate" | "zero"
+                 rebuild_h5_if_needed: bool=False,
+                ):
+        self.h5_path = h5_path
+        self.img_size = int(img_size)
+        self.storage_size = int(storage_size)  # kept for API compatibility
+        self.is_train = is_train
+        self.preload = preload
+        self.loaded = False
+
+        self.patch_scheduler = patch_scheduler
+        self.pos_center_prob = float(pos_center_prob)
+        self.pad_mode = pad_mode
+
+        # Albumentations (resize 없는 것만 넣는 걸 추천)
+        self.transform = train_transform if is_train else test_transform
+
+        # collect file paths (same as HybridDataset)
+        self.samples = []
+        for path, is_forged in [(authentic_path, 0), (forged_path, 1)]:
+            if not os.path.exists(path):
+                continue
+            files = [f for f in os.listdir(path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            limit = train_sample_num if is_train else test_sample_num
+            if limit:
+                files = files[:limit]
+
+            for file in files:
+                img_path = os.path.join(path, file)
+                mask_name = file.split('.')[0]
+                mask_path = os.path.join(masks_path, f"{mask_name}.npy")
+                self.samples.append((img_path, mask_path, is_forged))
+
+        print(f"Loaded {len(self.samples)} samples")
+
+        # build/validate HDF5
+        if (not os.path.exists(h5_path)) or rebuild_h5_if_needed:
+            print(f"⚙️ Building new group-based HDF5 at {h5_path}")
+            self._build_h5_group(h5_path)
+        else:
+            print(f"✅ Using existing HDF5 file: {h5_path}")
+
+        # preload
+        if preload:
+            print("📦 Preloading entire dataset into memory (group-based)...")
+            self.images, self.masks, self.paths, self.is_forged_arr, img_size = self._load_all_from_h5_group()
+            self.loaded = True
+
+        if verbose:
+            with h5py.File(self.h5_path, "r") as h5f:
+                n = int(h5f.attrs.get("num_samples", len(h5f.keys())))
+                print(f"📊 HDF5 groups: {n}")
+                print(f"   pad_mode={self.pad_mode}, pos_center_prob={self.pos_center_prob}")
+                print(f"   Dataset Image Size Stats:"
+                      f" Max Width: {img_size['max_w']}, Max Height: {img_size['max_h']}, "
+                      f"Min Width: {img_size['min_w']}, Min Height: {img_size['min_h']}")
+
+    # ----------------------------
+    # HDF5 builders/loaders (group-based)
+    # ----------------------------
+    def _build_h5_group(self, h5_path):
+        with h5py.File(h5_path, "w") as h5f:
+            n = len(self.samples)
+            h5f.attrs["num_samples"] = n
+
+            max_w, max_h = 0, 0
+            for i, (img_path, mask_path, is_forged) in enumerate(tqdm(self.samples)):
+                img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                H, W = img.shape[:2]
+                max_w, max_h = max(max_w, W), max(max_h, H)
+
+                mask = np.zeros((H, W), dtype=np.uint8)
+                if is_forged and os.path.exists(mask_path):
+                    try:
+                        mask_arr = np.load(mask_path)
+                        result = mask_arr
+
+                        if result.ndim == 3:
+                            # (C,H,W) -> (H,W,C) if needed
+                            if result.shape[0] < result.shape[2]:
+                                result = np.transpose(result, (1, 2, 0))
+                            result = np.max(result, axis=-1)
+
+                        result = (result > 0).astype(np.uint8)
+                        if result.shape != (H, W):
+                            # only if mismatch
+                            result = cv2.resize(result, (W, H), interpolation=cv2.INTER_NEAREST)
+                        mask = result
+                    except Exception as e:
+                        print(f"Mask error {mask_path}: {e}")
+                        mask = np.zeros((H, W), dtype=np.uint8)
+
+                grp = h5f.create_group(str(i))
+                grp.create_dataset("img", data=img, dtype="uint8", compression="lzf")
+                grp.create_dataset("mask", data=mask, dtype="uint8", compression="lzf")
+                grp.create_dataset("is_forged", data=np.uint8(is_forged))
+                grp.create_dataset("path", data=np.string_(mask_path))
+
+            h5f.attrs["max_width"] = int(max_w)
+            h5f.attrs["max_height"] = int(max_h)
+
+    def _load_all_from_h5_group(self):
+        imgs, masks, paths, forged = [], [], [], []
+        img_size = {
+            "min_h": float('inf'),
+            "min_w": float('inf'),
+            "max_h": 0,
+            "max_w": 0,
+        }
+        with h5py.File(self.h5_path, "r") as h5f:
+            n = int(h5f.attrs.get("num_samples", len(h5f.keys())))
+            for i in tqdm(range(n)):
+                grp = h5f[str(i)]
+                img = grp["img"][...]
+                mask = grp["mask"][...]
+
+                img_size["min_h"] = min(img_size["min_h"], img.shape[0])
+                img_size["min_w"] = min(img_size["min_w"], img.shape[1])
+                img_size["max_h"] = max(img_size["max_h"], img.shape[0])
+                img_size["max_w"] = max(img_size["max_w"], img.shape[1])
+
+                is_f = int(grp["is_forged"][()])
+                path = grp["path"][()]
+                if isinstance(path, bytes):
+                    path = path.decode("utf-8")
+                imgs.append(img)
+                masks.append(mask)
+                paths.append(path)
+                forged.append(is_f)
+        return imgs, masks, paths, np.array(forged, dtype=np.uint8), img_size
+
+    def _read_h5(self, idx):
+        with h5py.File(self.h5_path, "r") as h5f:
+            grp = h5f[str(idx)]
+            img = grp["img"][...]
+            mask = grp["mask"][...]
+            is_forged = int(grp["is_forged"][()])
+            path = grp["path"][()]
+            if isinstance(path, bytes):
+                path = path.decode("utf-8")
+        return img, mask, path, is_forged
+
+    # ----------------------------
+    # Main
+    # ----------------------------
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        if self.loaded:
+            img = self.images[idx]
+            mask = self.masks[idx]
+            path = self.paths[idx]
+            is_forged = int(self.is_forged_arr[idx])
+        else:
+            img, mask, path, is_forged = self._read_h5(idx)
+
+        # patch_size 결정
+        patch_size = self.patch_scheduler.sample() if self.patch_scheduler is not None else self.img_size
+
+        # pad + crop
+        img, mask = pad_to_min(img, mask, patch_size, pad_mode=self.pad_mode)
+
+        pos_p = self.pos_center_prob if self.is_train else 0.0
+        x0, y0 = sample_crop_xy(mask, patch_size, pos_center_prob=pos_p)
+
+        img_p = img[y0:y0 + patch_size, x0:x0 + patch_size]
+        mask_p = mask[y0:y0 + patch_size, x0:x0 + patch_size]
+
+        # Albumentations (resize 없는 것만)
+        if self.transform is not None:
+            out = self.transform(image=img_p, mask=mask_p)
+            img_t = out["image"]
+            mask_t = out["mask"].unsqueeze(0).float()
+        else:
+            img_t = torch.from_numpy(img_p).permute(2, 0, 1).float() / 255.0
+            mask_t = torch.from_numpy(mask_p).unsqueeze(0).float()
+
+        return img_t, mask_t, path, torch.tensor(is_forged, dtype=torch.float32)
+
+
 class HybridDataset(Dataset):
     """
     Hybrid lazy/full-memory dataset with Albumentations.

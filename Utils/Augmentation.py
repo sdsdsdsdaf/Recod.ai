@@ -219,6 +219,19 @@ def get_train_transform(aug_version="weak", aug_config=None, img_size=224):
             ),
             ToTensorV2()
         ], additional_targets={"mask": "mask"})
+    
+    if aug_version == "crop":
+        return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+
+        A.RandomBrightnessContrast(p=0.3),
+        A.GaussNoise(p=0.2),
+
+        A.Normalize(),
+        ToTensorV2(),
+    ], additional_targets={"mask": "mask"})
 
     # 2) weak/strong augmentation 가져오기
     aug = get_forge_augmentation(

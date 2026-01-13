@@ -24,7 +24,7 @@ warnings.filterwarnings(
 import torch
 from sklearn.model_selection import train_test_split, KFold
 from torch.utils.data import DataLoader, Subset
-from Utils.Dataset import HybridDataset
+from Utils.Dataset import HybridDataset, HybridCropDataset
 from Utils.utils import compute_pos_weight, train, evaluate, set_seed
 import torch.nn as nn
 import segmentation_models_pytorch as smp
@@ -37,7 +37,7 @@ from time import time
 from transformers import get_cosine_schedule_with_warmup
 
 from Utils.Model import DINOv2SegmentationModel, SwinTransformerSegmentationModel as Swin
-from Utils.Model import SwinDinoEnsembleModel, UnetWithSelfCorr
+from Utils.Model import SwinDinoEnsembleModel, SMPWithSelfCorr
 from Utils.Loss import FocalTverskyLoss
 from Utils.scheduler import cosine_with_min_lr
 from torch.utils.tensorboard import SummaryWriter
@@ -179,6 +179,7 @@ def cross_val_score(
         new_gamma=0.0,
         use_t = False,
         warmup_ratio=0.3,
+        pad_mode='reflect',
         **kwargs,
     ):
 
@@ -199,6 +200,7 @@ def cross_val_score(
 
         train_ds = Subset(dataset, train_idx)
         val_ds = Subset(dataset, val_idx)
+        val_ds.dataset.transform = test_transform 
 
         train_loader = DataLoader(dataset=train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=ues_pin_memory)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=ues_pin_memory)
@@ -217,7 +219,7 @@ def cross_val_score(
             raise ValueError("scheduler must be either get_cosine_schedule_with_warmup or cosine_with_min_lr")
 
         model = model_cls(**kwargs)
-        if model_cls.__name__ in [smp.FPN.__name__, smp.Unet.__name__, smp.DeepLabV3.__name__]:
+        if model_cls.__name__ == 'swinv2_base_22k_500k':
             
             ckpt = torch.load("swinv2_base_22k_500k.pth", map_location=device)
             sd = ckpt.get("model", ckpt)
@@ -231,13 +233,13 @@ def cross_val_score(
                 print("missing:", len(msg.missing_keys))
                 print("unexpected:", len(msg.unexpected_keys))
         
-        if fold == 0: print(model)
+        if fold == 0: pass # print(model)
         
         #TODO 후에 하드코딩아닌 함수인자로 받기
-# --- [모델 & 최적화 준비] ---
-# ... (model, optimizer_cls, lr 정의는 그대로) ...
+        # --- [모델 & 최적화 준비] ---
+        # ... (model, optimizer_cls, lr 정의는 그대로) ...
 
-# 💡 모델 구조에 따라 파라미터 그룹 동적 설정
+        # 💡 모델 구조에 따라 파라미터 그룹 동적 설정
         if hasattr(model, 'encoder') or hasattr(model, 'backbone'):
             # A. SMP (Unet/DeepLab) 구조일 때
             if hasattr(model, 'encoder'):
@@ -262,7 +264,7 @@ def cross_val_score(
             # B. DINOv2 (ViT) 기반 커스텀 구조일 때 (사용자님의 현재 모델)
             decoder_params = list(model.decoder_low.parameters()) + list(model.decoder_high.parameters())
             params_group = [
-                {"params": model.backbone.parameters(), "lr": lr * 0.1}, # ViT는 훨씬 느리게 학습 (0.1)
+                {"params": model.backbone.parameters(), "lr": lr * 0.3}, # ViT는 훨씬 느리게 학습 (0.1)
                 {"params": decoder_params, "lr": lr},                    # 디코더는 빠르게 학습
             ]
 
@@ -271,15 +273,15 @@ def cross_val_score(
             swin_params = list(model.swin_model.backbone.parameters())
             decoder_params = list(model.swin_model.decoder.parameters())
             params_group = [
-                {"params": swin_params, "lr": lr * 0.5},   # Swin은 매우 느리게 학습 (0.05)
+                {"params": swin_params, "lr": lr * 0.3},   # Swin은 매우 느리게 학습 (0.05)
                 {"params": decoder_params, "lr": lr},       # 디코더는 빠르게 학습
             ]
-        elif model_cls.__name__ == "UnetWithSelfCorr":
+        elif model_cls.__name__ == "SMPWithSelfCorr":
             # D. Unet with Self-Correlation 구조일 때
-            backbone_params = model.unet.encoder.parameters()
-            decoder_params = model.unet.decoder.parameters() if hasattr(model.unet, 'decoder') else None
+            backbone_params = model.smp.encoder.parameters()
+            decoder_params = model.smp.decoder.parameters() if hasattr(model.smp, 'decoder') else None
             params_group = [
-                {"params": backbone_params, "lr": lr * 0.2},  # 백본은 느리게 학습
+                {"params": backbone_params, "lr": lr * 0.3},  # 백본은 느리게 학습
                 {"params": decoder_params, "lr": lr},         # 디코더는 빠르게 학습
             ]
         else:
@@ -294,6 +296,7 @@ def cross_val_score(
         if scheduler_cls is not None: scheduler.last_epoch = -1; scheduler.step()
 
         model = model.to(device)
+        
         log[f'fold{fold + 1}'] = train(
             model, train_loader, val_loader, optimizer, epoch,
             device, cls_loss, dice_loss, alpha, beta, gamma, loss_scaler, scheduler,
@@ -304,15 +307,17 @@ def cross_val_score(
             freeze_epoch=freeze_epoch, freeze_layer=freeze_layer, after_freeze_lr=after_freeze_lr,
             new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma, use_t=use_t,
             train_transform=train_transform, test_transform=test_transform,
+            pad_mode=pad_mode, val_epcoch=10
         )
         
         score = evaluate(
             model, val_loader, device, cls_loss, dice_loss, alpha, beta, gamma, loss_scaler,
-            interpolation=interpolation, threshold=threshold,
+            interpolation=interpolation, threshold=threshold, pad_mode=pad_mode,
             min_area_ratio=min_area_ratio, low_conf_max_prob=low_conf_max_prob,
             low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel,
             train_transform=train_transform, test_transform=test_transform,
         )
+
         fold_end_time = time()
         elapsed_time = fold_end_time - fold_start_time
         print(f"Final Score F1: {score} TOTAL LOSS: {score['loss_total']:.4f} CLS LOSS: {score['loss_cls']:.4f} DICE LOSS: {score['loss_dice']:.4f} IS FORGED IMG LOSS: {score['loss_img']:.4f}")
@@ -364,7 +369,8 @@ if __name__ == "__main__":
     }
 
     # Preprocessing
-    IMG_SIZE = 192
+    IMG_SIZE = 512
+    PAD_MODE = 'constant'  # 'constant', 'edge', 'symmetric', 'reflect', 'wrap'
 
     """
     train_transform = A.Compose([
@@ -376,42 +382,41 @@ if __name__ == "__main__":
     ])
     """
 
-    train_transform = get_train_transform(img_size=IMG_SIZE)
+    train_transform = get_train_transform(img_size=IMG_SIZE, aug_version="crop")
 
     test_transform = A.Compose([
-        # 테스트 때는 중앙 크롭 혹은 그냥 리사이즈 -> 슬라이딩 윈도우 방식 고려
-        A.Resize(IMG_SIZE, IMG_SIZE),
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2()
     ])
 
     #Learning HyperParams
-    full_ds = HybridDataset(
-        "train_data_dino.h5",
+    full_ds = HybridCropDataset(
+        f"train_data_crop_{IMG_SIZE}px.h5",
         paths['train_authentic'],
         paths['train_forged'],
         paths['train_masks'],
         img_size=IMG_SIZE,
         is_train=True,
         preload=True,
-        verbose=True,
+        verbose=True,   
         train_transform=train_transform,
         test_transform=test_transform,
         train_sample_num=TRAIN_SAMPLE_NUM,
-        test_sample_num=TEST_SAMPLE_NUM
+        test_sample_num=TEST_SAMPLE_NUM,
+        pad_mode=PAD_MODE
     )
 
-    BATCH_SIZE = 20
-    NUM_EPOCHS = 50
-    NEW_LR_RATIO = 0.3 
-    FREEZE_EPOCH = 50
-    FREEZE_LAYER = None 
-    LR = 1e-4
+    BATCH_SIZE = 8
+    NUM_EPOCHS = 60
+    NEW_LR_RATIO = 1 
+    FREEZE_EPOCH = 61
+    FREEZE_LAYER = 3
+    LR = 1e-3
     WARMUP_RATIO = 0.3
     # POS_W = torch.tensor(1) # Resized
-    MODEL_CLS = UnetWithSelfCorr
+    MODEL_CLS = SMPWithSelfCorr
     base_model_config = {
-        'encoder_name': 'tu-swinv2_base_window12_192',
+        'encoder_name': "tu-efficientnet_b4",
         'encoder_weights': 'imagenet',
         'in_channels': 3,
         'classes': 1,
@@ -469,9 +474,15 @@ if __name__ == "__main__":
     beta = 1 - alpha
     gamma = 0.5
     loss_scaler = 1
+    new_alpha = alpha
+    new_beta = beta
+    new_gamma = gamma
+    """
     new_alpha = 0.1
     new_beta = 1 - new_alpha
     new_gamma = 0.0
+    """
+
     optimizer_cls = torch.optim.AdamW
 
     """
@@ -498,7 +509,7 @@ if __name__ == "__main__":
 
     #ACK
     USE_LOG = True
-    RUN_NAME = f"SwinV2_unet_self_corr_weak_aug_lr{LR:.0e}_add_GN_add_x.detach"
+    RUN_NAME = f"effiB6_Encoder_Freeze_FPN_Self_Corr_weak_aug_lr{LR:.0e}_unfreeze_{FREEZE_LAYER}stages"
 
 
     print_hyperparams()
@@ -508,19 +519,22 @@ if __name__ == "__main__":
     train_log = cross_val_score(
         MODEL_CLS, k=5, dataset=full_ds, device=device, batch_size=BATCH_SIZE,
         ues_pin_memory=USE_PIN_MEM, num_workers=NUM_WORKERS, cls_loss=cls_loss, dice_loss=dice_loss, loss_scaler=loss_scaler,
-        alpha=alpha, beta=beta, gamma=gamma, epoch=NUM_EPOCHS, interpolation=INTERPOLATION,
+        alpha=alpha, beta=beta, gamma=gamma, epoch=NUM_EPOCHS, interpolation=INTERPOLATION, pad_mode=PAD_MODE,
         threshold=THRESHOLD, min_area_ratio=MIN_AREA_RATIO, low_conf_max_prob=LOW_CONF_MAX_PROB,
         low_viz_thr=LOW_VIZ_THR, low_conf_min_pixel=LOW_CONF_MIN_PIXEL, lr=LR, use_log=USE_LOG, warmup_ratio=WARMUP_RATIO,
         optimizer_cls=optimizer_cls, scheduler_cls=scheduler_cls, scheduler_params=scheduler_params, use_amp=USE_AMP,
         freeze_epoch=FREEZE_EPOCH, freeze_layer=FREEZE_LAYER, after_freeze_lr=NEW_LR_RATIO,  run_name=RUN_NAME, use_t=USE_T,
         new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma, train_transform=train_transform, test_transform=test_transform,
         
-        base_unet_cls=smp.Unet, corr_level = 3,
+        base_smp_cls=smp.FPN, corr_level = 3,
         corr_pool = 1,corr_topk = 1, temperature = 1, **base_model_config
             
     )
 
     '''
+    # Self-Correlation UNet
+    
+
     # Swin
     backbone_name='swin_base_patch4_window7_224',
     decoder_type='unet',

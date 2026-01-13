@@ -1,7 +1,9 @@
 import json
+from pathlib import Path
 from time import time
 from typing import Optional, Union
 
+from matplotlib import pyplot as plt
 import numba
 import torch.nn as nn
 import numpy as np
@@ -20,7 +22,11 @@ from collections import defaultdict
 from torch.amp import autocast, GradScaler
 from datetime import timedelta
 import gc
-from pytorch_toolbelt import losses as L
+import seaborn as sns
+try:
+    from Model import SMPWithSelfCorr
+except:
+    from Utils.Model import SMPWithSelfCorr
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
@@ -79,23 +85,34 @@ def postprocessing(proba_map: np.ndarray,
                    threshold: float,
                    low_conf_max_prob: float,
                    low_viz_thr: float,
-                   low_conf_min_pixel: int):
+                   low_conf_min_pixel_ratio: float,
+                   min_area_ratio: float=1e-4):
+    
+    img_h, img_w = proba_map.shape
 
     # 1) Low confidence filtering stays the same
+    low_conf_min_pixel = int(img_h * img_w * low_conf_min_pixel_ratio)
     if is_low_confidence(proba_map, low_conf_max_prob, low_viz_thr, low_conf_min_pixel):
-        return np.zeros(original_size, dtype=np.uint8)
+        orig_h, orig_w = original_size
+        return np.zeros((orig_h, orig_w), dtype=np.uint8)
 
+    
     # 2) Threshold FIRST (in model resolution → cheap)
     mask = (proba_map > threshold).astype(np.uint8)
+    area = int(mask.sum())
+    min_area = max(10, int(min_area_ratio * img_w * img_h))  # 비례
 
     # 3) Noise cleanup (in small resolution → super cheap)
-    kernel = np.ones((3,3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    if area >= min_area:
+        k = max(3, min(7, (int(min(img_h, img_w) * 0.008) | 1)))  # 홀수, 3~7 clamp
+        kernel = np.ones((k, k), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
     # 4) Now resize to original resolution (only once)
-    mask = cv2.resize(mask, (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST) # (W, H)
-
+    orig_h, orig_w = original_size
+    if mask.shape != (orig_h, orig_w):
+        mask = cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
 
     return mask
 
@@ -344,18 +361,99 @@ def rebuild_optimizer_preserve_state(old_optimizer, model, new_lr_ratio=None):
 from typing import Optional
 
 def freeze_encoder_after_epoch(
-    model, current_epoch, freeze_at: int, optimizer=None, n_layers: Optional[int] = None, new_lr_ratio: Optional[float] = None,
+    model, current_epoch, freeze_at: int, optimizer=None, n_layers: Optional[int] = None, new_lr_ratio: Optional[float] = None, patch_embed_freeze: Optional[bool] = True,
 ):
+    
+
+    """
+    Dynamically freezes encoder/backbone parameters at a specific training epoch.
+
+    This function is designed to support multiple backbone architectures
+    (e.g., CNN-based encoders, Swin Transformer, ViT/DINOv2 backbones) and
+    applies layer-wise freezing logic depending on the detected model structure.
+
+    The freezing is triggered only when `current_epoch == freeze_at`.
+    If the epoch does not match, the function exits without modifying the model
+    or optimizer.
+
+    Main behaviors:
+    - Supports both `model.encoder` and `model.backbone` style architectures.
+    - For Swin Transformer-like encoders:
+        * Freezes patch embedding optionally.
+        * Freezes encoder stages up to a given layer index (`n_layers`).
+    - For ViT/DINOv2 backbones:
+        * Uses transformer `blocks` for stage-wise freezing.
+    - For CNN-style encoders:
+        * Attempts `get_stages()` first, otherwise falls back to `children()`.
+
+    After freezing, the optimizer can optionally be rebuilt while preserving
+    internal states (e.g., momentum, Adam moments) using
+    `rebuild_optimizer_preserve_state`.
+
+    Args:
+        model (nn.Module):
+            The model containing an `encoder` or `backbone` module.
+
+        current_epoch (int):
+            The current training epoch.
+
+        freeze_at (int):
+            Epoch index at which freezing should be applied.
+            Freezing is skipped unless `current_epoch == freeze_at`.
+
+        optimizer (torch.optim.Optimizer, optional):
+            Optimizer to rebuild after freezing.
+            If None, optimizer handling is skipped.
+
+        n_layers (int, optional):
+            Number of *last* layers/stages to keep trainable.
+            - If None or <= 0: freeze the entire encoder/backbone.
+            - If > 0: only the last `n_layers` stages remain trainable.
+
+        new_lr_ratio (float, optional):
+            Ratio used when rebuilding the optimizer to adjust learning rates
+            for unfrozen parameters.
+
+        patch_embed_freeze (bool, optional):
+            Whether to freeze patch embedding layers (relevant for ViT/Swin).
+            Default is True.
+
+    Returns:
+
+        return (torch.optim.Optimizer):
+            Rebuilt optimizer if `optimizer` is provided,
+            otherwise returns the original optimizer unchanged.
+
+    Notes:
+        - This function is intended to be called inside the training loop.
+        - Freezing is applied *in-place* by setting `requires_grad`.
+        - The optimizer rebuild is necessary to correctly handle parameter
+          groups after freezing.
+    """
+    
+    def freeze_upto(model, N, freeze_patch_embed=True):
+        if N == None or 0:
+            for p in model.encoder.parameters():
+                p.requires_grad = False
+                return 
+        if freeze_patch_embed:
+            for p in model.encoder.model.patch_embed.parameters():
+                p.requires_grad = False
+
+        for i in range(N, 4):
+            for p in getattr(model.encoder.model, f"layers_{3-i}").parameters():
+                p.requires_grad = False
+
     """
     Freeze encoder (CNN) 또는 backbone (ViT) 파라미터를 동적으로 처리합니다.
     (함수 이름은 기존과 동일하게 유지합니다.)
     """
-    if current_epoch != freeze_at:
+    if current_epoch < freeze_at:
         return optimizer
 
     # --- 1. Encoder/Backbone 모듈 이름 결정 및 객체 가져오기 ---
     encoder_name = None
-    if hasattr(model, 'encoder'):
+    if hasattr(model, 'encoder') or hasattr(model.smp, 'encoder'):
         encoder_name = 'encoder'
     elif hasattr(model, 'backbone'):
         encoder_name = 'backbone'
@@ -364,48 +462,62 @@ def freeze_encoder_after_epoch(
         print("Skipping freeze: 'encoder' 또는 'backbone' 속성을 찾을 수 없어 파라미터 제어를 건너뜁니다.")
         return optimizer
 
-    encoder_module = getattr(model, encoder_name) 
+    encoder_module = getattr(model, encoder_name, None) 
     print(f"🔒 Freezing {encoder_name} at epoch {freeze_at}...")
 
-    # --- 2. 스테이지/블록 목록 가져오기 ---
-    if encoder_name == 'backbone' and hasattr(encoder_module, 'blocks'):
-        # DINOv2 (ViT) 구조: 'blocks' (Transformer Block 리스트) 사용
-        stages = encoder_module.blocks 
-    else:
-        # CNN (SMP) 구조: get_stages()를 시도하거나 children() 사용
-        try:
-            stages = encoder_module.get_stages()
-        except AttributeError:
-            stages = list(encoder_module.children())
+    smp_model = model.smp if isinstance(model, SMPWithSelfCorr) else model
+    backbone_name = smp_model.encoder.model.layers_0.__class__.__name__
 
-    # --- 3. Freeze 로직 적용 (이하 원본 로직과 동일) ---
-    if n_layers is None or n_layers <= 0:
-        # 전체 freeze
-        for param in encoder_module.parameters():
-            param.requires_grad = False
-        print(f"➡️ Entire {encoder_name} frozen.")
-    else:
-        # 마지막 n_layers만 제외하고 freeze
-        num_stages = len(stages)
-        freeze_until = max(0, num_stages - n_layers)
-        
-        for i, stage in enumerate(stages):
-            requires_grad = (i >= freeze_until)
-            for param in stage.parameters():
-                param.requires_grad = requires_grad
 
-        print(f"➡️ {encoder_name} frozen except for last {n_layers} stage(s).")
+    try:
+        if "Swin" in backbone_name:
+            # TODO 후에 patch_embed = True로
+            freeze_upto(smp_model, n_layers, freeze_patch_embed=False)
+    except:
+        # --- 2. 스테이지/블록 목록 가져오기 ---
+        if encoder_name == 'backbone' and hasattr(encoder_module, 'blocks'):
+            # DINOv2 (ViT) 구조: 'blocks' (Transformer Block 리스트) 사용
+            stages = encoder_module.blocks 
+        else:
+            # CNN (SMP) 구조: get_stages()를 시도하거나 children() 사용
+            try:
+                stages = encoder_module.get_stages()
+            except AttributeError:
+                stages = list(encoder_module.children())
+
+        # --- 3. Freeze 로직 적용 (이하 원본 로직과 동일) ---
+        if n_layers is None or n_layers <= 0:
+            # 전체 freeze
+            for param in encoder_module.parameters():
+                param.requires_grad = False
+            print(f"➡️ Entire {encoder_name} frozen.")
+        else:
+            # 마지막 n_layers만 제외하고 freeze
+            num_stages = len(stages)
+            freeze_until = max(0, num_stages - n_layers)
+            
+            for i, stage in enumerate(stages):
+                requires_grad = (i >= freeze_until)
+                for param in stage.parameters():
+                    param.requires_grad = requires_grad
+
+            print(f"➡️ {encoder_name} frozen except for last {n_layers} stage(s).")
     
     # --- 4. Optimizer Rebuild ---
     if optimizer is not None:
         
-        print(f"OLd LR: {optimizer.param_groups[1]['lr']}")
+        try:
+            print(f"Optimzer new LR: {optimizer.param_groups[1]['lr']}")
+        except:
+            print(f'Optimizer new LR: {optimizer.param_groups[0]["lr"]}')
         optimizer = rebuild_optimizer_preserve_state(optimizer, model, new_lr_ratio) 
         print("🧩 Optimizer updated (state prune/rebuild 필요).")
         try:
             print(f"Optimzer new LR: {optimizer.param_groups[1]['lr']}")
         except:
             print(f'Optimizer new LR: {optimizer.param_groups[0]["lr"]}')
+
+
 
     return optimizer
 
@@ -415,6 +527,7 @@ def freeze_encoder_after_epoch(
 
 
 def compute_pos_weight(
+        
     dataset=None,
     masks_path=None,
     authentic_path=None,
@@ -526,9 +639,12 @@ def mask_to_instances(mask, min_area: int = 1) -> list[np.ndarray]:
     return instances
 
 def is_low_confidence(prob_map, low_conf_max_prob=0.5, low_viz_thr=0.06, low_conf_min_pixel=100):
-    if float(prob_map.max()) >= low_conf_max_prob: #일단 “low confidence 아님으로 판단
+    # spike에 덜 민감한 high quantile 사용
+    hi = float(np.quantile(prob_map, 0.995))
+    if hi >= low_conf_max_prob:
         return False
-    cover = int((prob_map >= low_viz_thr).sum()) #검출됨
+
+    cover = int((prob_map >= low_viz_thr).sum())
     return cover < low_conf_min_pixel
 
 
@@ -538,8 +654,8 @@ def train(
         interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.02,
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, # PostProcessing Setting,
         fold=None, use_amp=False, use_log=False, freeze_epoch=15, freeze_layer=None, after_freeze_lr=None,
-        writer=None, new_alpha=0.2, new_beta=0.8, new_gamma=0.0,
-        train_transform=None, test_transform=None, use_t=False,
+        writer=None, new_alpha=0.2, new_beta=0.8, new_gamma=0.0, val_epcoch=1,
+        train_transform=None, test_transform=None, use_t=False, pad_mode='reflect'
     ):
 
     train_loss_log_dict = defaultdict(list)
@@ -593,37 +709,38 @@ def train(
                     train_loss_log_dict[k].append(v)
         if val_loader is None:
             continue
-
-        metric_score = evaluate(
-            model=model, 
-            val_loader=val_loader, 
-            device=device, 
-            cls_loss_fn=cls_loss_fn, 
-            dice_loss_fn=dice_loss_fn, 
-            alpha=alpha, 
-            beta=beta,
-            gamma=gamma, 
-            loss_scaler=loss_scaler, 
-            interpolation=interpolation, 
-            threshold=threshold, 
-            min_area_ratio=min_area_ratio, 
-            low_conf_max_prob=low_conf_max_prob, 
-            low_viz_thr=low_viz_thr, 
-            low_conf_min_pixel=low_conf_min_pixel, 
-            scaler=scaler,
-            train_transform=train_transform,
-            test_transform=test_transform
-        )
-        
-        print(f"[{E}/{epoch}] VAL F1: {metric_score['f1_score']:.4f}"
-              f" TRAIN TOTAL LOSS: {metric_score['loss_total']:.4f}"
-              f" CLS LOSS: {metric_score['loss_cls']:.4f} "
-              f" DICE LOSS: {metric_score['loss_dice']:.4f} "
-              f" IS FORGED IMG LOSS: {metric_score['loss_img']:.4f} \n"
-              f" SCALING CLS LOSS: {alpha * loss_scaler * metric_score['loss_cls']:.4f} "
-              f" SCALING DICE LOSS: {beta * metric_score['loss_dice']:.4f} "
-              f" SCALING IS FORGED IMG LOSS: {gamma * metric_score['loss_img']:.4f} "
+        if E % val_epcoch == 0 or E > epoch - 5:
+            metric_score = evaluate(
+                model=model, 
+                val_loader=val_loader, 
+                device=device, 
+                cls_loss_fn=cls_loss_fn, 
+                dice_loss_fn=dice_loss_fn, 
+                alpha=alpha, 
+                beta=beta,
+                gamma=gamma, 
+                loss_scaler=loss_scaler, 
+                interpolation=interpolation, 
+                threshold=threshold, 
+                min_area_ratio=min_area_ratio, 
+                low_conf_max_prob=low_conf_max_prob, 
+                low_viz_thr=low_viz_thr, 
+                low_conf_min_pixel=low_conf_min_pixel, 
+                scaler=scaler,
+                train_transform=train_transform,
+                test_transform=test_transform,
+                pad_mode=pad_mode,
             )
+        
+            print(f"[{E}/{epoch}] VAL F1: {metric_score['f1_score']:.4f}"
+                f" TRAIN TOTAL LOSS: {metric_score['loss_total']:.4f}"
+                f" CLS LOSS: {metric_score['loss_cls']:.4f} "
+                f" DICE LOSS: {metric_score['loss_dice']:.4f} "
+                f" IS FORGED IMG LOSS: {metric_score['loss_img']:.4f} \n"
+                f" SCALING CLS LOSS: {alpha * loss_scaler * metric_score['loss_cls']:.4f} "
+                f" SCALING DICE LOSS: {beta * metric_score['loss_dice']:.4f} "
+                f" SCALING IS FORGED IMG LOSS: {gamma * metric_score['loss_img']:.4f} "
+                )
         
     
         if writer is not None:
@@ -632,15 +749,17 @@ def train(
             writer.add_scalar("Train/Loss_DICE", losses["loss_dice"], E)
             writer.add_scalar("Train/Loss_IMG", losses["loss_img"], E)
             writer.add_scalar("Train/Loss_TOTAL", losses["loss_total"], E)
+           
 
             # --- Validation losses ---
-            writer.add_scalar("Val/Loss_CLS", metric_score["loss_cls"], E)
-            writer.add_scalar("Val/Loss_DICE", metric_score["loss_dice"], E)
-            writer.add_scalar("Val/Loss_IMG", metric_score["loss_img"], E)
-            writer.add_scalar("Val/Loss_TOTAL", metric_score["loss_total"], E)
+            if E % val_epcoch == 0 or E > epoch - 5:
+                writer.add_scalar("Val/Loss_CLS", metric_score["loss_cls"], E)
+                writer.add_scalar("Val/Loss_DICE", metric_score["loss_dice"], E)
+                writer.add_scalar("Val/Loss_IMG", metric_score["loss_img"], E)
+                writer.add_scalar("Val/Loss_TOTAL", metric_score["loss_total"], E)
 
-            # --- Validation F1 ---
-            writer.add_scalar("Val/F1_Score", metric_score["f1_score"], E)
+                # --- Validation F1 ---
+                writer.add_scalar("Val/F1_Score", metric_score["f1_score"], E)
 
 
         # ======= 📸 TENSORBOARD IMAGE LOGGING =======
@@ -746,36 +865,37 @@ def train(
 
                 # ── TensorBoard 기록
                 writer.add_image(f"Samples/FOLD{fold}/epoch_{E}", grid_labeled, E)
- 
-        for k, v in metric_score.items():
-            val_loss_log_dict[k].append(v)
-        if scheduler and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(metric_score['f1_score'])
 
-        f1_log_list.append(metric_score['f1_score'])
-        if metric_score['f1_score'] > best1_f1:
-            print(f"🏆 Best1 F1: {metric_score['f1_score']:.4f} before {best1_f1:.4f}")
-            best1_f1 = metric_score['f1_score']
-        
-        if metric_score['f1_score'] > min(best5_f1):
-            best5_f1.remove(min(best5_f1))
-            best5_f1.append(metric_score['f1_score'])
-            sorted_best = sorted(best5_f1, reverse=True)
-            rank = sorted_best.index(metric_score['f1_score']) + 1
+        if E % val_epcoch == 0 or E > epoch - 5:
+            for k, v in metric_score.items():
+                val_loss_log_dict[k].append(v)
+            if scheduler and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(metric_score['f1_score'])
 
-            if fold is not None:
-                save_path = os.path.join("Weights", f"FOLD{fold}", f"best{rank}.pth")
-            else:
-                save_path = os.path.join("Weights", f"best{rank}.pth")
+            f1_log_list.append(metric_score['f1_score'])
+            if metric_score['f1_score'] > best1_f1:
+                print(f"🏆 Best1 F1: {metric_score['f1_score']:.4f} before {best1_f1:.4f}")
+                best1_f1 = metric_score['f1_score']
             
-            try:
-                torch.save(model.state_dict(), save_path)
-                print(f"🔥 F1 {metric_score['f1_score']:.4f} entered Top5 → Rank {rank}/5")
-                print(f"💾 Saved checkpoint: {save_path}")
-            except Exception as e:
-                print(f"⚠️ Failed to save model at {save_path}: {e}")
-    epoch_end_time = time()
-    print(f"[EPOCH {E}/{epoch}] TIME : {timedelta(seconds=epoch_end_time - epoch_start_time)}")
+            if metric_score['f1_score'] > min(best5_f1):
+                best5_f1.remove(min(best5_f1))
+                best5_f1.append(metric_score['f1_score'])
+                sorted_best = sorted(best5_f1, reverse=True)
+                rank = sorted_best.index(metric_score['f1_score']) + 1
+
+                if fold is not None:
+                    save_path = os.path.join("Weights", f"FOLD{fold}", f"best{rank}.pth")
+                else:
+                    save_path = os.path.join("Weights", f"best{rank}.pth")
+                
+                try:
+                    torch.save(model.state_dict(), save_path)
+                    print(f"🔥 F1 {metric_score['f1_score']:.4f} entered Top5 → Rank {rank}/5")
+                    print(f"💾 Saved checkpoint: {save_path}")
+                except Exception as e:
+                    print(f"⚠️ Failed to save model at {save_path}: {e}")
+        epoch_end_time = time()
+        print(f"[EPOCH {E}/{epoch}] TIME : {timedelta(seconds=epoch_end_time - epoch_start_time)}")
 
     torch.cuda.synchronize()
     gc.collect()
@@ -794,7 +914,7 @@ def train(
 def evaluate(
         model, val_loader, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=8,
         interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, train_transform=None, test_transform=None,
-        low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, scaler=None,
+        low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, scaler=None, pad_mode = "reflect"
     ):
     model.eval()
     total_loss = 0
@@ -804,11 +924,13 @@ def evaluate(
     solution = {'case_id': [], 'annotation': [], 'shape': []}
     file_path_list = []
     is_forged_img_loss_fn = torch.nn.BCEWithLogitsLoss()
+    logit_map, cls_loss, dice_loss, loss = None, None, None, None
     
     for imgs, masks, mask_path, is_forged in tqdm(val_loader, desc="Calculating Loss", leave=False):
 
         imgs, masks, is_forged = imgs.to(device, non_blocking=True), masks.to(device, non_blocking=True), is_forged.to(device, non_blocking=True)
         masks:torch.Tensor = masks.squeeze()
+        """
         with autocast(device_type=device.type, enabled=scaler is not None):
             if getattr(model, 'classification_head', None) is not None:
                 logit_map, is_forged_logit = model(imgs)
@@ -844,7 +966,7 @@ def evaluate(
         cls_total += cls_loss.item()
         dice_total += dice_loss.item()
         img_total += img_loss.item() if getattr(model, 'classification_head', None) is not None else 0
-
+        """
 
 
         for img, mask_path, is_forged in zip(imgs, mask_path, is_forged):
@@ -879,12 +1001,12 @@ def evaluate(
         model, None, device, test_path_file_list=file_path_list, img_size=img.shape[1],
         max_size=None, interpolation=interpolation, threshold=threshold, min_area_ratio=min_area_ratio,
         low_conf_max_prob=low_conf_max_prob, low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel,
-        train_transform=train_transform, test_transform=test_transform
+        train_transform=train_transform, test_transform=test_transform, pad_mode=pad_mode
     )
     del img, imgs, masks, logit_map, cls_loss, dice_loss, loss
     torch.cuda.empty_cache()
 
-    solution['case_id'] = solution['case_id']
+    solution['case_id'] = solution['case_id']   
     prediction['case_id'] = prediction['case_id']
 
     if prediction['case_id'] != solution['case_id']:
@@ -1006,9 +1128,10 @@ def train_one_epoch(model:nn.Module, epoch, train_loader, optimizer, device:Unio
         masks = to3dims(masks)
 
         if getattr(model, 'classification_head', None) is not None:
-            cls_loss = cls_loss_fn(outputs, masks)
+            
             
             with autocast(device_type=device_type, enabled=False):
+                cls_loss = cls_loss_fn(outputs, masks)
                 dice_loss = dice_loss_fn(outputs.float(), masks.float())
                 img_loss = is_forged_img_loss_fn(is_forged_logit.squeeze(), is_forged.float())
                 if torch.isnan(dice_loss):
@@ -1016,8 +1139,10 @@ def train_one_epoch(model:nn.Module, epoch, train_loader, optimizer, device:Unio
                     dice_loss = torch.nan_to_num(loss=dice_loss, nan=0.0, posinf=1.0, neginf=0.0)
             loss = alpha * cls_loss*loss_scaler + beta * dice_loss + img_loss*gamma
         else:
-            cls_loss = cls_loss_fn(outputs, masks)
-            dice_loss = dice_loss_fn(outputs, masks)
+            with autocast(device_type=device_type, enabled=False): 
+                cls_loss = cls_loss_fn(outputs, masks)
+                dice_loss = dice_loss_fn(outputs, masks)
+                
             if torch.isnan(dice_loss):
                 print(f"[NaN DETECTED] Skipping backward at step {step}")
                 dice_loss = torch.nan_to_num(dice_loss, nan=0.0, posinf=1.0, neginf=0.0)
@@ -1056,10 +1181,10 @@ def train_one_epoch(model:nn.Module, epoch, train_loader, optimizer, device:Unio
             decoder_params = model.decoder.parameters() if hasattr(model, 'decoder') else None
             encoder_norm_target_name = 'encoder'
         
-        # Unet Correlated 모델
-        elif getattr(model, 'unet', None) is not None:
-            backbone_params = model.unet.encoder.parameters()
-            decoder_params = model.unet.decoder.parameters() if hasattr(model.unet, 'decoder') else None
+        # SMP Correlated 모델
+        elif getattr(model, 'smp', None) is not None:
+            backbone_params = model.smp.encoder.parameters()
+            decoder_params = model.smp.decoder.parameters() if hasattr(model.smp, 'decoder') else None
             encoder_norm_target_name = 'unet_encoder'
 
         elif getattr(model.swin_model, 'backbone', None) is not None:
@@ -1116,6 +1241,7 @@ def train_one_epoch(model:nn.Module, epoch, train_loader, optimizer, device:Unio
             writer.add_scalar("Norm/Encoder", encoder_norm, global_step)
             writer.add_scalar("Norm/Decoder", decoder_norm, global_step)
             writer.add_scalar("Norm/Cls_head", cls_head_norm, global_step)
+            writer.add_scalar("Gate/Corr_Ratio", torch.sigmoid(model.alpha).detach().cpu().item() if getattr(model, "alpha", None) is not None else 0, global_step)
             if epoch < freeze_epoch:
                 writer.add_scalar("LR/encoder", optimizer.param_groups[0]["lr"], global_step)
                 writer.add_scalar("LR/decoder", optimizer.param_groups[1]["lr"], global_step)
@@ -1148,24 +1274,295 @@ def train_one_epoch(model:nn.Module, epoch, train_loader, optimizer, device:Unio
         "loss_img": is_forged_img_loss / len(train_loader)
     }
 
+import math
+import torch
+import torch.nn.functional as F
 
-def predict(model:nn.Module, test_path, device, test_path_file_list=None, img_size=128, max_size=None, interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, low_conf_max_prob = 0.06, low_viz_thr = 0.04, low_conf_min_pixel = 128, scaler: Optional[torch.amp.GradScaler] = None, train_transform=None, test_transform=None) -> dict[str, str]:
+@torch.no_grad()
+def _make_weight_map(patch_size: int, device, mode: str = "cosine", eps: float = 1e-6):
+    """
+    Weight map for smooth overlap merging.
+    mode:
+      - "uniform": all ones
+      - "cosine": cosine window (low weight near borders)
+      - "gaussian": gaussian-like (low weight near borders)
+    """
+    if mode == "uniform":
+        w = torch.ones((1, 1, patch_size, patch_size), device=device, dtype=torch.float32)
+        return w
+
+    yy = torch.linspace(-1.0, 1.0, patch_size, device=device)
+    xx = torch.linspace(-1.0, 1.0, patch_size, device=device)
+    Y, X = torch.meshgrid(yy, xx, indexing="ij")
+
+    if mode == "cosine":
+        # cosine window: cos(pi/2 * x) in [-1,1] => [0,1]
+        wx = torch.cos((math.pi / 2.0) * X).clamp_min(0.0)
+        wy = torch.cos((math.pi / 2.0) * Y).clamp_min(0.0)
+        w2d = (wx * wy).clamp_min(eps)
+    elif mode == "gaussian":
+        # simple gaussian-like bump
+        sigma = 0.5
+        w2d = torch.exp(-(X**2 + Y**2) / (2 * sigma**2)).clamp_min(eps)
+    else:
+        raise ValueError(f"Unknown weight mode: {mode}")
+
+    return w2d.unsqueeze(0).unsqueeze(0).float()
+
+
+@torch.no_grad()
+def sliding_window_inference(
+    model,
+    img: torch.Tensor,
+    patch_size: int = 512,
+    stride: int = 256,
+    device: torch.device | str | None = None,
+    amp: bool = True,
+    weight_mode: str = "cosine",
+    pad_mode: str = "reflect",  # "reflect" or "constant"
+    return_logits: bool = True, # True: logits, False: probs(sigmoid)
+):
+    """
+    Sliding window inference for a single image (no resize).
+    Args:
+      model: segmentation model, expects (B,3,H,W) -> (B,1,H,W) logits (recommended)
+      img: torch Tensor, shape (3,H,W) or (1,3,H,W), float32 (normalized or 0~1 ok)
+      patch_size: tile size
+      stride: step size (patch_size//2 typical)
+      device: model device (if None, infer from model)
+      amp: autocast on/off (CUDA)
+      weight_mode: "cosine"|"gaussian"|"uniform"
+      pad_mode: "reflect" or "constant"
+      return_logits: if False, returns sigmoid probabilities
+    Returns:
+      pred_full: (1,H,W) tensor on CPU (logits or probs)
+    """
+    if img.dim() == 3:
+        img = img.unsqueeze(0)  # (1,3,H,W)
+    assert img.dim() == 4 and img.size(1) in (1, 3), f"img must be (B,C,H,W), got {img.shape}"
+
+    # device
+    if device is None:
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
+
+    model.eval()
+
+    B, C, H, W = img.shape
+    assert B == 1, "This function is written for a single image (B=1)."
+
+    # pad to cover full tiles
+    pad_h = (patch_size - (H % patch_size)) % patch_size
+    pad_w = (patch_size - (W % patch_size)) % patch_size
+
+    # additionally ensure we can slide with stride and cover borders
+    # so we pad enough that last starting index exists
+    if H < patch_size:
+        pad_h = max(pad_h, patch_size - H)
+    if W < patch_size:
+        pad_w = max(pad_w, patch_size - W)
+
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+
+    img = img.to(device, non_blocking=True)
+
+    if pad_mode == "reflect":
+        img_pad = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode="reflect")
+    elif pad_mode == "constant":
+        img_pad = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0)
+    else:
+        raise ValueError(f"Unknown pad_mode: {pad_mode}")
+
+    _, _, Hp, Wp = img_pad.shape
+
+    # accumulators
+    pred_sum = torch.zeros((1, 1, Hp, Wp), device=device, dtype=torch.float32)
+    w_sum = torch.zeros((1, 1, Hp, Wp), device=device, dtype=torch.float32)
+
+    weight = _make_weight_map(patch_size, device=device, mode=weight_mode)  # (1,1,s,s)
+
+    # sliding coords
+    ys = list(range(0, max(1, Hp - patch_size + 1), stride))
+    xs = list(range(0, max(1, Wp - patch_size + 1), stride))
+    # ensure last tile covers the end
+    if ys[-1] != Hp - patch_size:
+        ys.append(Hp - patch_size)
+    if xs[-1] != Wp - patch_size:
+        xs.append(Wp - patch_size)
+
+    use_cuda_amp = amp and (device.type == "cuda")
+
+    for y0 in ys:
+        for x0 in xs:
+            tile = img_pad[:, :, y0:y0+patch_size, x0:x0+patch_size]  # (1,C,s,s)
+
+            if use_cuda_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    if getattr(model, 'classification_head', None) is not None:
+                        out, _ = model(tile)
+                    else:
+                        out = model(tile)
+            else:
+                if getattr(model, 'classification_head', None) is not None:
+                    out, _ = model(tile)
+                else:
+                    out = model(tile)
+
+            # normalize output to (1,1,s,s)
+            if isinstance(out, (list, tuple)):
+                out = out[0]
+            if out.dim() == 4 and out.size(1) != 1:
+                # if model outputs multi-class, take channel 0 or adjust here
+                out = out[:, :1]
+            elif out.dim() == 3:
+                out = out.unsqueeze(1)
+
+            out = out.float()  # accumulate in fp32
+            pred_sum[:, :, y0:y0+patch_size, x0:x0+patch_size] += out * weight
+            w_sum[:, :, y0:y0+patch_size, x0:x0+patch_size] += weight
+
+    pred = pred_sum / (w_sum.clamp_min(1e-6))
+
+    # unpad back to original size
+    pred = pred[:, :, pad_top:pad_top+H, pad_left:pad_left+W]  # (1,1,H,W)
+
+    if not return_logits:
+        pred = pred.sigmoid()
+
+    # return (1,H,W) on CPU
+    return pred.squeeze(0)
+
+def stats(x: torch.Tensor, bins: int = 4096):
+    """
+    x: 1D torch tensor, range [0,1]
+    """
+    # torch → numpy (한 번만)
+    x = x.detach()
+    x = x[torch.isfinite(x)]
+    if x.numel() == 0:
+        return {"n": 0}
+
+    x = x.clamp(0.0, 1.0).cpu().numpy()
+
+    hist, edges = np.histogram(x, bins=bins, range=(0.0, 1.0))
+
+    cdf = np.cumsum(hist)
+    total = cdf[-1]
+
+    def q_at(q):
+        idx = np.searchsorted(cdf, q * total)
+        idx = min(idx, bins - 1)
+        return edges[idx]
+
+    return {
+        "n": int(x.size),
+        "min": float(x.min()),
+        "mean": float(x.mean()),
+        "max": float(x.max()),
+        "p10": float(q_at(0.1)),
+        "p50": float(q_at(0.5)),
+        "p90": float(q_at(0.9)),
+    }
+
+def visualize_probas(proba_map_list: list[np.ndarray], THRESHOLD: float = 0.5):
+
+    proba_map_list_resize = [
+    F.interpolate(
+        x.unsqueeze(0).unsqueeze(0),
+        size=(512, 512),
+        mode="bilinear",
+        align_corners=False
+    ).squeeze(0).squeeze(0).cpu().numpy()
+    for x in proba_map_list
+]
+
+    avg_proba_map = np.mean(proba_map_list_resize, axis=0)
+
+    # 총 6행 (5모델 + 평균 1)
+    num_rows = len(proba_map_list) + 1  # 6
+    fig, axes = plt.subplots(num_rows, 2, figsize=(10, num_rows * 3))
+    fig.tight_layout(pad=4)
+
+    for i in range(len(proba_map_list_resize)):
+        proba_map = proba_map_list_resize[i]
+
+        # Heatmap
+        sns.heatmap(
+            proba_map, 
+            ax=axes[i, 0], 
+            cmap="viridis"
+        )
+        axes[i, 0].set_title(f"Model {i+1} - Heatmap")
+        axes[i, 0].axis("off")
+        
+        # Threshold mask
+        mask_pred = (proba_map > THRESHOLD).astype(np.uint8)
+        sns.heatmap(
+            mask_pred,
+            ax=axes[i, 1],
+            cmap="gray",
+            vmin=0,
+            vmax=1,
+            cbar=False
+        )
+        axes[i, 1].set_title(f"Model {i+1} - Mask (> {THRESHOLD})")
+        axes[i, 1].axis("off")
+
+    # ===== 평균 결과 =====
+    sns.heatmap(
+        avg_proba_map, 
+        ax=axes[-1, 0], 
+        cmap="viridis"
+    )
+    axes[-1, 0].set_title("Average - Heatmap")
+    axes[-1, 0].axis("off")
+
+    avg_mask = (avg_proba_map > THRESHOLD).astype(np.uint8)
+    sns.heatmap(
+        avg_mask,
+        ax=axes[-1, 1],
+        cmap="gray",
+        vmin=0,
+        vmax=1,
+        cbar=False
+    )
+    axes[-1, 1].set_title(f"Average - Mask (> {THRESHOLD})")
+    axes[-1, 1].axis("off")
+
+    plt.show()
+
+def predict(model:nn.Module, test_path, device, weight_path_list=None, test_path_file_list=None, img_size=128, max_size=None, interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, low_conf_max_prob = 0.06, low_viz_thr = 0.04, low_conf_min_pixel = 128, scaler: Optional[torch.amp.GradScaler] = None, train_transform=None, test_transform=None, pad_mode='reflect', writter=None) -> dict[str, str]:
 
     """
     Return RLE string
     """
     device = str_to_device(device)
     device_type = device.type
+    if weight_path_list is None:
+        weight_path_list = [0]
 
-    model.eval()
+
     predictions = {'case_id': [], 'annotation': []}
     if test_path_file_list is None:
         test_files = [f for f in os.listdir(test_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))][:max_size]
     else:
         test_files = test_path_file_list
+
+    all_logits_forged = []
+    all_logits_auth = []
+    
+
     with torch.no_grad():
+        
         for file in tqdm(test_files, desc="Predicting", leave=False):
             case_id = file.split('.')[0]
+            proba_map_list = []
 
             #Load Img
             if test_path is None:
@@ -1176,6 +1573,13 @@ def predict(model:nn.Module, test_path, device, test_path_file_list=None, img_si
             img = cv2.imread(img_path)
             original_size = img.shape[:2]
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            img_path = img_path.replace('train_images', 'train_masks').replace('.jpg', '.npy').replace('.png', '.npy').replace('.jpeg', '.npy')
+            p = Path(img_path)
+
+            # 'authentic' 디렉토리 제거
+            mask_path = Path(*[part for part in p.parts if part != "authentic" and part != "forged"])
+            mask = np.zeros_like(original_size) if 'authentic' or 'test' in img_path else np.load(mask_path)
             # processed_img = preprocessing(img, img_size, interpolation) -> NN방식 ImageNet 분산으로 바꾸지 않음
             # img_tensor = torch.from_numpy(processed_img)
 
@@ -1186,18 +1590,52 @@ def predict(model:nn.Module, test_path, device, test_path_file_list=None, img_si
             img_tensor = img_tensor.to(device)
             min_area = int(original_size[0] * original_size[1] * min_area_ratio)
 
+            for weight_path in weight_path_list:
+                if weight_path != 0:
+                    model.load_state_dict(torch.load(weight_path, map_location=device))
+                model.eval()
 
-            with autocast(device_type=device_type, enabled=scaler is not None):
-                if getattr(model, 'classification_head', None) is not None:
-                    logit_map, _ = model(img_tensor)
-                else:
-                    logit_map = model(img_tensor)
+                with autocast(device_type=device_type, enabled=scaler is not None):
+                    if img_tensor.size(2) != img_size or img_tensor.size(3) != img_size:
+                        logit_map = sliding_window_inference(
+                            model,
+                            img_tensor.squeeze(0),  # (3,H,W)
+                            patch_size=img_size,
+                            stride=img_size // 2,
+                            device=device,
+                            amp=(scaler is not None),
+                            weight_mode="cosine",
+                            pad_mode=pad_mode,
+                            return_logits=True,
+                        )  # (H,W)
+                    elif getattr(model, 'classification_head', None) is not None:
+                        logit_map, _ = model(img_tensor)
+                    else:
+                        logit_map = model(img_tensor)
                 
-            proba_map = torch.sigmoid(logit_map)
-            proba_map = proba_map.squeeze().cpu().numpy()  # (H, W)
-            mask_pred = postprocessing(proba_map, original_size, threshold, low_conf_max_prob, low_viz_thr, low_conf_min_pixel)
-            case_id = int(case_id)
 
+                proba_map = torch.sigmoid(logit_map)
+                proba_map_list.append(proba_map.squeeze(0).squeeze(0))
+
+                if weight_path_list != [0]:
+                    
+                    del logit_map, proba_map
+                    torch.cuda.empty_cache()
+
+            if weight_path_list != [0]:
+                visualize_probas(proba_map_list, THRESHOLD=threshold)      
+            proba_map_mean = torch.stack(proba_map_list).mean(dim=0)    
+            proba_map_mean = proba_map_mean.squeeze() # (H, W)
+            
+            
+            if mask.sum() > 0:
+                all_logits_forged.append(proba_map_mean.flatten().detach().cpu())
+            else:
+                all_logits_auth.append(proba_map_mean.flatten().detach().cpu())
+
+            proba_map_mean = proba_map_mean.cpu().numpy()
+            mask_pred = postprocessing(proba_map_mean, original_size, threshold, low_conf_max_prob, low_viz_thr, low_conf_min_pixel)
+            case_id = int(case_id)
             #후에 resize하기 전으로 변경 (img_size 똑같을 때)
             if mask_pred.sum() < min_area:
                 predictions['case_id'].append(case_id)
@@ -1209,6 +1647,24 @@ def predict(model:nn.Module, test_path, device, test_path_file_list=None, img_si
                 predictions['annotation'].append(
                     ("authentic" if len(instances) == 0 else rle_encode(instances))
                 )
+
+        
+
+        if writter is not None:
+            
+            # concat
+            forged_vals = torch.cat(all_logits_forged)
+            auth_vals   = torch.cat(all_logits_auth)
+
+            print("=== Logit Statistics ===")
+            print(f"Forged Images: {len(all_logits_forged)}")
+            print(stats(forged_vals))
+            print(f"Authentic Images: {len(all_logits_auth)}")
+            print(stats(auth_vals))
+            print("========================")
+
+            writter.add_histogram("Logits/Forged", forged_vals)
+            writter.add_histogram("Logits/Authentic", auth_vals)
 
     return predictions
 
