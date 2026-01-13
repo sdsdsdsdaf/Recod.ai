@@ -12,3 +12,5 @@ tqdm==4.67.1
 timm==0.9.16
 opencv-python==4.11.0.86
 transformers==4.53.0
+albumentations==2.0.8
+seaborn==0.13.2
