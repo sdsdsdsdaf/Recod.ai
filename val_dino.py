@@ -368,11 +368,13 @@ if __name__ == "__main__":
         'train_authentic': os.path.join(TRAIN_DIR, "authentic"),
         'train_forged': os.path.join(TRAIN_DIR, "forged"),
         'train_masks': os.path.join(COMP_DIR, "train_masks"),
-        'test_images': TEST_DIR
+        'test_images': TEST_DIR,
+        'sup_images': os.path.join(COMP_DIR, "supplemental_images"),
+        'sup_masks': os.path.join(COMP_DIR, "supplemental_masks")
     }
 
     # Preprocessing
-    IMG_SIZE = 512
+    IMG_SIZE = 384
     PAD_MODE = 'constant'  # 'constant', 'edge', 'symmetric', 'reflect', 'wrap'
 
     """
@@ -406,7 +408,10 @@ if __name__ == "__main__":
         test_transform=test_transform,
         train_sample_num=TRAIN_SAMPLE_NUM,
         test_sample_num=TEST_SAMPLE_NUM,
-        pad_mode=PAD_MODE
+        pad_mode=PAD_MODE,
+        rebuild_h5_if_needed=True,
+        supplemental_images_path=paths['sup_images'],
+        supplemental_masks_path=paths["sup_masks"]
     )
 
     BATCH_SIZE = 8
@@ -427,7 +432,7 @@ if __name__ == "__main__":
     }
 
     POS_W_RATIO = 0.12
-    POS_W = compute_pos_weight(dataset=full_ds, h5_path="train_data_crop_384px.h5") * POS_W_RATIO
+    POS_W = compute_pos_weight(dataset=full_ds, h5_path=f"train_data_crop_{IMG_SIZE}px.h5") * POS_W_RATIO
     cls_loss = SoftBCEWithLogitsLoss(pos_weight=POS_W, smooth_factor=0.1)
     DECODER_TYPE = 'cnn_cbam' # [simple_mlp, unet_style, cnn_se, cnn_cbam] 
     VIT_DIM = 384

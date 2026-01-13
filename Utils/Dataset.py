@@ -166,6 +166,9 @@ class HybridCropDataset(Dataset):
                  pos_center_prob: float=0.7,
                  pad_mode: str="reflect",   # "reflect" | "replicate" | "zero"
                  rebuild_h5_if_needed: bool=False,
+                 supplemental_images_path: str=None,
+                 supplemental_masks_path: str=None,
+                 use_supplemental: bool=True,
                 ):
         self.h5_path = h5_path
         self.img_size = int(img_size)
@@ -196,6 +199,23 @@ class HybridCropDataset(Dataset):
                 mask_name = file.split('.')[0]
                 mask_path = os.path.join(masks_path, f"{mask_name}.npy")
                 self.samples.append((img_path, mask_path, is_forged))
+                
+        if is_train and use_supplemental and supplemental_images_path and supplemental_masks_path:
+            if os.path.exists(supplemental_images_path) and os.path.exists(supplemental_masks_path):
+                sup_files = [f for f in os.listdir(supplemental_images_path)
+                             if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+                for file in sup_files:
+                    img_path = os.path.join(supplemental_images_path, file)
+                    mask_name = file.rsplit('.', 1)[0]
+                    mask_path = os.path.join(supplemental_masks_path, f"{mask_name}.npy")
+
+                    # mask가 있으면 forged로 취급, 없으면 authentic 취급
+                    is_forged = 1 if os.path.exists(mask_path) else 0
+                    self.samples.append((img_path, mask_path, is_forged))
+
+            else:
+                print("⚠️ supplemental path not found. skip supplemental.")
 
         print(f"Loaded {len(self.samples)} samples")
 
