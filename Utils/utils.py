@@ -99,15 +99,11 @@ def postprocessing(proba_map: np.ndarray,
     
     # 2) Threshold FIRST (in model resolution → cheap)
     mask = (proba_map > threshold).astype(np.uint8)
-    area = int(mask.sum())
-    min_area = max(10, int(min_area_ratio * img_w * img_h))  # 비례
-
-    # 3) Noise cleanup (in small resolution → super cheap)
-    if area >= min_area:
-        k = max(3, min(7, (int(min(img_h, img_w) * 0.008) | 1)))  # 홀수, 3~7 clamp
-        kernel = np.ones((k, k), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    
+    k = max(3, min(7, (int(min(img_h, img_w) * 0.008) | 1)))  # 홀수, 3~7 clamp
+    kernel = np.ones((k, k), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
     # 4) Now resize to original resolution (only once)
     orig_h, orig_w = original_size
@@ -675,7 +671,7 @@ def train(
         interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.02,
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, # PostProcessing Setting,
         fold=None, use_amp=False, use_log=False, freeze_epoch=15, freeze_layer=None, after_freeze_lr=None,
-        writer=None, new_alpha=0.2, new_beta=0.8, new_gamma=0.0, val_epcoch=1,
+        writer=None, new_alpha=0.2, new_beta=0.8, new_gamma=0.0, val_epcoch=1, batch_size=8,
         train_transform=None, test_transform=None, use_t=False, pad_mode='reflect'
     ):
 
@@ -751,6 +747,7 @@ def train(
                 train_transform=train_transform,
                 test_transform=test_transform,
                 pad_mode=pad_mode,
+                tiles_batch_size=batch_size
             )
         
             print(f"[{E}/{epoch}] VAL F1: {metric_score['f1_score']:.4f}"
@@ -933,8 +930,8 @@ def train(
 
 @torch.no_grad()
 def evaluate(
-        model, val_loader, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=8,
-        interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, train_transform=None, test_transform=None,
+        model, val_loader, device:Union[torch.device,str],cls_loss_fn, dice_loss_fn,  alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=8,
+        tiles_batch_size=8, interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, train_transform=None, test_transform=None,
         low_conf_max_prob=0.06, low_viz_thr=0.04, low_conf_min_pixel=128, scaler=None, pad_mode = "reflect"
     ):
     model.eval()
@@ -1022,7 +1019,7 @@ def evaluate(
         model, None, device, test_path_file_list=file_path_list, img_size=img.shape[1],
         max_size=None, interpolation=interpolation, threshold=threshold, min_area_ratio=min_area_ratio,
         low_conf_max_prob=low_conf_max_prob, low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel,
-        train_transform=train_transform, test_transform=test_transform, pad_mode=pad_mode
+        train_transform=train_transform, test_transform=test_transform, pad_mode=pad_mode, tile_batch_size=tiles_batch_size
     )
     del img, imgs, masks, logit_map, cls_loss, dice_loss, loss
     torch.cuda.empty_cache()
@@ -1070,7 +1067,7 @@ def mask_path2img_path(mask_path, is_forged):
     file_stem = os.path.splitext(mask_file)[0]
 
     # 이미지 경로 후보 생성
-    img_dir = os.path.join(parent_dir, "train_images", subfolder)
+    img_dir = os.path.join(parent_dir, "train_images", subfolder) if "supplemental_masks" not in mask_dir else os.path.join(parent_dir, "supplemental_images")
     candidates = [os.path.join(img_dir, file_stem + ext) for ext in [".jpg", ".jpeg", ".png"]]
 
     # 존재하는 파일 찾기
@@ -1084,7 +1081,7 @@ def mask_path2img_path(mask_path, is_forged):
 
 
 
-def train_one_epoch(model:nn.Module, epoch, train_loader, optimizer, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=1.0, scaler: Optional[torch.amp.GradScaler] = None, log_file=None, use_t=False, freeze_epoch=10, writer=None) -> dict[str, float]:
+def train_one_epoch(model:nn.Module, epoch, train_loader, optimizer, device:Union[torch.device,str], cls_loss_fn, dice_loss_fn, scheduler, alpha=0.5, beta=0.5, gamma=0.3, loss_scaler=1.0, scaler: Optional[torch.amp.GradScaler] = None, log_file=None, use_t=False, freeze_epoch=10, writer=None, batch_size=8) -> dict[str, float]:
 
     
     if hasattr(model, 'swin_model'):
@@ -1124,11 +1121,6 @@ def train_one_epoch(model:nn.Module, epoch, train_loader, optimizer, device:Unio
             break
         #후에 resize하는 과정도 train할 지 결정
         optimizer.zero_grad()
-
-        # DEBUG
-        for name, param in model.named_parameters():
-            if torch.isnan(param).any() or torch.isinf(param).any():
-                print(f"❌ {name} contains NaN/Inf")
 
         with autocast(device_type=device_type, enabled=scaler is not None):
             if getattr(model, 'classification_head', None) is not None:
@@ -1331,133 +1323,6 @@ def _make_weight_map(patch_size: int, device, mode: str = "cosine", eps: float =
     return w2d.unsqueeze(0).unsqueeze(0).float()
 
 
-@torch.no_grad()
-def sliding_window_inference(
-    model,
-    img: torch.Tensor,
-    patch_size: int = 512,
-    stride: int = 256,
-    device: torch.device | str | None = None,
-    amp: bool = True,
-    weight_mode: str = "cosine",
-    pad_mode: str = "reflect",  # "reflect" or "constant"
-    return_logits: bool = True, # True: logits, False: probs(sigmoid)
-):
-    """
-    Sliding window inference for a single image (no resize).
-    Args:
-      model: segmentation model, expects (B,3,H,W) -> (B,1,H,W) logits (recommended)
-      img: torch Tensor, shape (3,H,W) or (1,3,H,W), float32 (normalized or 0~1 ok)
-      patch_size: tile size
-      stride: step size (patch_size//2 typical)
-      device: model device (if None, infer from model)
-      amp: autocast on/off (CUDA)
-      weight_mode: "cosine"|"gaussian"|"uniform"
-      pad_mode: "reflect" or "constant"
-      return_logits: if False, returns sigmoid probabilities
-    Returns:
-      pred_full: (1,H,W) tensor on CPU (logits or probs)
-    """
-    if img.dim() == 3:
-        img = img.unsqueeze(0)  # (1,3,H,W)
-    assert img.dim() == 4 and img.size(1) in (1, 3), f"img must be (B,C,H,W), got {img.shape}"
-
-    # device
-    if device is None:
-        try:
-            device = next(model.parameters()).device
-        except StopIteration:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device)
-
-    model.eval()
-
-    B, C, H, W = img.shape
-    assert B == 1, "This function is written for a single image (B=1)."
-
-    # pad to cover full tiles
-    pad_h = (patch_size - (H % patch_size)) % patch_size
-    pad_w = (patch_size - (W % patch_size)) % patch_size
-
-    # additionally ensure we can slide with stride and cover borders
-    # so we pad enough that last starting index exists
-    if H < patch_size:
-        pad_h = max(pad_h, patch_size - H)
-    if W < patch_size:
-        pad_w = max(pad_w, patch_size - W)
-
-    pad_top = pad_h // 2
-    pad_bottom = pad_h - pad_top
-    pad_left = pad_w // 2
-    pad_right = pad_w - pad_left
-
-    img = img.to(device, non_blocking=True)
-
-    if pad_mode == "reflect":
-        img_pad = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode="reflect")
-    elif pad_mode == "constant":
-        img_pad = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0)
-    else:
-        raise ValueError(f"Unknown pad_mode: {pad_mode}")
-
-    _, _, Hp, Wp = img_pad.shape
-
-    # accumulators
-    pred_sum = torch.zeros((1, 1, Hp, Wp), device=device, dtype=torch.float32)
-    w_sum = torch.zeros((1, 1, Hp, Wp), device=device, dtype=torch.float32)
-
-    weight = _make_weight_map(patch_size, device=device, mode=weight_mode)  # (1,1,s,s)
-
-    # sliding coords
-    ys = list(range(0, max(1, Hp - patch_size + 1), stride))
-    xs = list(range(0, max(1, Wp - patch_size + 1), stride))
-    # ensure last tile covers the end
-    if ys[-1] != Hp - patch_size:
-        ys.append(Hp - patch_size)
-    if xs[-1] != Wp - patch_size:
-        xs.append(Wp - patch_size)
-
-    use_cuda_amp = amp and (device.type == "cuda")
-
-    for y0 in ys:
-        for x0 in xs:
-            tile = img_pad[:, :, y0:y0+patch_size, x0:x0+patch_size]  # (1,C,s,s)
-
-            if use_cuda_amp:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    if getattr(model, 'classification_head', None) is not None:
-                        out, _ = model(tile)
-                    else:
-                        out = model(tile)
-            else:
-                if getattr(model, 'classification_head', None) is not None:
-                    out, _ = model(tile)
-                else:
-                    out = model(tile)
-
-            # normalize output to (1,1,s,s)
-            if isinstance(out, (list, tuple)):
-                out = out[0]
-            if out.dim() == 4 and out.size(1) != 1:
-                # if model outputs multi-class, take channel 0 or adjust here
-                out = out[:, :1]
-            elif out.dim() == 3:
-                out = out.unsqueeze(1)
-
-            out = out.float()  # accumulate in fp32
-            pred_sum[:, :, y0:y0+patch_size, x0:x0+patch_size] += out * weight
-            w_sum[:, :, y0:y0+patch_size, x0:x0+patch_size] += weight
-
-    pred = pred_sum / (w_sum.clamp_min(1e-6))
-
-    # unpad back to original size
-    pred = pred[:, :, pad_top:pad_top+H, pad_left:pad_left+W]  # (1,1,H,W)
-
-    if not return_logits:
-        pred = pred.sigmoid()
-
-    # return (1,H,W) on CPU
-    return pred.squeeze(0)
 
 def stats(x: torch.Tensor, bins: int = 4096):
     """
@@ -1558,7 +1423,160 @@ def visualize_probas(proba_map_list: list[np.ndarray], THRESHOLD: float = 0.5):
 
     plt.show()
 
-def predict(model:nn.Module, test_path, device, weight_path_list=None, test_path_file_list=None, img_size=128, max_size=None, interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, low_conf_max_prob = 0.06, low_viz_thr = 0.04, low_conf_min_pixel = 128, scaler: Optional[torch.amp.GradScaler] = None, train_transform=None, test_transform=None, pad_mode='reflect', writter=None) -> dict[str, str]:
+@torch.no_grad()
+def sliding_window_inference(
+    model,
+    img: torch.Tensor,
+    patch_size: int = 512,
+    stride: int = 256,
+    device: torch.device | str | None = None,
+    amp: bool = True,
+    weight_mode: str = "cosine",
+    pad_mode: str = "reflect",  # "reflect" or "constant"
+    return_logits: bool = True, # True: logits, False: probs(sigmoid)
+    tiles_batch: int = 16
+):
+    """
+    Sliding window inference for a single image (no resize).
+    Args:
+      model: segmentation model, expects (B,3,H,W) -> (B,1,H,W) logits (recommended)
+      img: torch Tensor, shape (3,H,W) or (1,3,H,W), float32 (normalized or 0~1 ok)
+      patch_size: tile size
+      stride: step size (patch_size//2 typical)
+      device: model device (if None, infer from model)
+      amp: autocast on/off (CUDA)
+      weight_mode: "cosine"|"gaussian"|"uniform"
+      pad_mode: "reflect" or "constant"
+      return_logits: if False, returns sigmoid probabilities
+    Returns:
+      pred_full: (1,H,W) tensor on CPU (logits or probs)
+    """
+    if img.dim() == 3:
+        img = img.unsqueeze(0)  # (1,3,H,W)
+    assert img.dim() == 4 and img.size(1) in (1, 3), f"img must be (B,C,H,W), got {img.shape}"
+
+    # device
+    if device is None:
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
+
+    model.eval()
+
+    B, C, H, W = img.shape
+    assert B == 1, "This function is written for a single image (B=1)."
+
+    # pad to cover full tiles
+    pad_h = (patch_size - (H % patch_size)) % patch_size
+    pad_w = (patch_size - (W % patch_size)) % patch_size
+
+    # additionally ensure we can slide with stride and cover borders
+    # so we pad enough that last starting index exists
+    if H < patch_size:
+        pad_h = max(pad_h, patch_size - H)
+    if W < patch_size:
+        pad_w = max(pad_w, patch_size - W)
+
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+
+    img = img.to(device, non_blocking=True)
+
+    if pad_mode == "reflect":
+        img_pad = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode="reflect")
+    elif pad_mode == "constant":
+        img_pad = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0)
+    else:
+        raise ValueError(f"Unknown pad_mode: {pad_mode}")
+
+    _, _, Hp, Wp = img_pad.shape
+
+    # accumulators
+    pred_sum = torch.zeros((1, 1, Hp, Wp), device=device, dtype=torch.float32)
+    w_sum = torch.zeros((1, 1, Hp, Wp), device=device, dtype=torch.float32)
+
+    weight = _make_weight_map(patch_size, device=device, mode=weight_mode)  # (1,1,s,s)
+
+    # sliding coords
+    ys = list(range(0, max(1, Hp - patch_size + 1), stride))
+    xs = list(range(0, max(1, Wp - patch_size + 1), stride))
+    # ensure last tile covers the end
+    if ys[-1] != Hp - patch_size:
+        ys.append(Hp - patch_size)
+    if xs[-1] != Wp - patch_size:
+        xs.append(Wp - patch_size)
+
+    use_cuda_amp = amp and (device.type == "cuda")
+
+    tiles = []
+    coords = []
+
+    def flush():
+        if not tiles:
+            return
+
+        batch = torch.cat(tiles, dim=0).to(device, non_blocking=True)  # (N, C, s, s)
+
+        # forward (batched)
+        if use_cuda_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                if getattr(model, "classification_head", None) is not None:
+                    out, _ = model(batch)
+                else:
+                    out = model(batch)
+        else:
+            if getattr(model, "classification_head", None) is not None:
+                out, _ = model(batch)
+            else:
+                out = model(batch)
+
+        # normalize output to (N,1,s,s)
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        if out.dim() == 4 and out.size(1) != 1:
+            out = out[:, :1]
+        elif out.dim() == 3:
+            out = out.unsqueeze(1)
+
+        out = out.float()  # accumulate fp32
+
+        # scatter-add back
+        for i, (y0, x0) in enumerate(coords):
+            pred_sum[:, :, y0:y0+patch_size, x0:x0+patch_size] += out[i:i+1] * weight
+            w_sum[:, :, y0:y0+patch_size, x0:x0+patch_size] += weight
+
+        tiles.clear()
+        coords.clear()
+
+
+    for y0 in ys:
+        for x0 in xs:
+            tile = img_pad[:, :, y0:y0+patch_size, x0:x0+patch_size]  # (1,C,s,s)
+            tiles.append(tile)
+            coords.append((y0, x0))
+
+            if len(tiles) >= tiles_batch:
+                flush()
+
+    flush()  # 
+
+    pred = pred_sum / (w_sum.clamp_min(1e-6))
+
+    # unpad back to original size
+    pred = pred[:, :, pad_top:pad_top+H, pad_left:pad_left+W]  # (1,1,H,W)
+
+    if not return_logits:
+        pred = pred.sigmoid()
+
+    # return (1,H,W) on CPU
+    return pred.squeeze(0)
+
+@torch.no_grad()
+def predict(model:nn.Module, test_path, device, tile_batch_size=8, weight_path_list=None, test_path_file_list=None, img_size=128, max_size=None, interpolation=cv2.INTER_NEAREST, threshold=0.5, min_area_ratio=0.002, low_conf_max_prob = 0.06, low_viz_thr = 0.04, low_conf_min_pixel = 128, scaler: Optional[torch.amp.GradScaler] = None, train_transform=None, test_transform=None, pad_mode='reflect', writter=None) -> dict[str, str]:
 
     """
     Return RLE string
@@ -1570,6 +1588,7 @@ def predict(model:nn.Module, test_path, device, weight_path_list=None, test_path
 
 
     predictions = {'case_id': [], 'annotation': []}
+    weight_states = [torch.load(w, map_location=device) if w != 0 else 0 for w in weight_path_list]
     if test_path_file_list is None:
         test_files = [f for f in os.listdir(test_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))][:max_size]
     else:
@@ -1600,7 +1619,11 @@ def predict(model:nn.Module, test_path, device, weight_path_list=None, test_path
 
             # 'authentic' 디렉토리 제거
             mask_path = Path(*[part for part in p.parts if part != "authentic" and part != "forged"])
-            mask = np.zeros_like(original_size) if 'authentic' or 'test' in img_path else np.load(mask_path)
+            if 'authentic' in img_path or 'test' in img_path:
+                mask = np.zeros(original_size)
+            else:
+                if 'supplmental' in  str(mask_path): print(mask_path)
+                mask = np.load(mask_path)
             # processed_img = preprocessing(img, img_size, interpolation) -> NN방식 ImageNet 분산으로 바꾸지 않음
             # img_tensor = torch.from_numpy(processed_img)
 
@@ -1611,9 +1634,9 @@ def predict(model:nn.Module, test_path, device, weight_path_list=None, test_path
             img_tensor = img_tensor.to(device)
             min_area = int(original_size[0] * original_size[1] * min_area_ratio)
 
-            for weight_path in weight_path_list:
-                if weight_path != 0:
-                    model.load_state_dict(torch.load(weight_path, map_location=device))
+            for state in weight_states:
+                if state != 0:
+                    model.load_state_dict(state)
                 model.eval()
 
                 with autocast(device_type=device_type, enabled=scaler is not None):
@@ -1628,6 +1651,7 @@ def predict(model:nn.Module, test_path, device, weight_path_list=None, test_path
                             weight_mode="cosine",
                             pad_mode=pad_mode,
                             return_logits=True,
+                            tiles_batch=tile_batch_size
                         )  # (H,W)
                     elif getattr(model, 'classification_head', None) is not None:
                         logit_map, _ = model(img_tensor)
@@ -1647,7 +1671,7 @@ def predict(model:nn.Module, test_path, device, weight_path_list=None, test_path
                 visualize_probas(proba_map_list, THRESHOLD=threshold)      
             proba_map_mean = torch.stack(proba_map_list).mean(dim=0)    
             proba_map_mean = proba_map_mean.squeeze() # (H, W)
-            
+            h, w  = proba_map_mean.size()
             
             if mask.sum() > 0:
                 all_logits_forged.append(proba_map_mean.flatten().detach().cpu())
@@ -1657,6 +1681,7 @@ def predict(model:nn.Module, test_path, device, weight_path_list=None, test_path
             proba_map_mean = proba_map_mean.cpu().numpy()
             mask_pred = postprocessing(proba_map_mean, original_size, threshold, low_conf_max_prob, low_viz_thr, low_conf_min_pixel)
             case_id = int(case_id)
+        
             #후에 resize하기 전으로 변경 (img_size 똑같을 때)
             if mask_pred.sum() < min_area:
                 predictions['case_id'].append(case_id)

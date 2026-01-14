@@ -297,6 +297,7 @@ def cross_val_score(
 
         model = model.to(device)
         
+        
         log[f'fold{fold + 1}'] = train(
             model, train_loader, val_loader, optimizer, epoch,
             device, cls_loss, dice_loss, alpha, beta, gamma, loss_scaler, scheduler,
@@ -307,14 +308,14 @@ def cross_val_score(
             freeze_epoch=freeze_epoch, freeze_layer=freeze_layer, after_freeze_lr=after_freeze_lr,
             new_alpha=new_alpha, new_beta=new_beta, new_gamma=new_gamma, use_t=use_t,
             train_transform=train_transform, test_transform=test_transform,
-            pad_mode=pad_mode, val_epcoch=10
+            pad_mode=pad_mode, val_epcoch=10, batch_size=batch_size
         )
         
         score = evaluate(
             model, val_loader, device, cls_loss, dice_loss, alpha, beta, gamma, loss_scaler,
             interpolation=interpolation, threshold=threshold, pad_mode=pad_mode,
             min_area_ratio=min_area_ratio, low_conf_max_prob=low_conf_max_prob,
-            low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel,
+            low_viz_thr=low_viz_thr, low_conf_min_pixel=low_conf_min_pixel, tiles_batch_size=batch_size,
             train_transform=train_transform, test_transform=test_transform,
         )
 
@@ -374,7 +375,7 @@ if __name__ == "__main__":
     }
 
     # Preprocessing
-    IMG_SIZE = 384
+    IMG_SIZE = 512
     PAD_MODE = 'constant'  # 'constant', 'edge', 'symmetric', 'reflect', 'wrap'
 
     """
@@ -409,7 +410,7 @@ if __name__ == "__main__":
         train_sample_num=TRAIN_SAMPLE_NUM,
         test_sample_num=TEST_SAMPLE_NUM,
         pad_mode=PAD_MODE,
-        rebuild_h5_if_needed=True,
+        rebuild_h5_if_needed=False,
         supplemental_images_path=paths['sup_images'],
         supplemental_masks_path=paths["sup_masks"]
     )

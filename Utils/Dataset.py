@@ -715,6 +715,21 @@ class HybridDataset(Dataset):
     
 
 if __name__ == "__main__":
+    COMP_DIR = r"C:\Users\user\.cache\kagglehub\competitions\recodai-luc-scientific-image-forgery-detection"
+    TRAIN_DIR = os.path.join(COMP_DIR, "train_images")
+    TEST_DIR = os.path.join(COMP_DIR, "test_images")
+    IMG_SIZE = 384
+    PAD_MODE = 'constant'
+    
+    paths = {
+        'train_authentic': os.path.join(TRAIN_DIR, "authentic"),
+        'train_forged': os.path.join(TRAIN_DIR, "forged"),
+        'train_masks': os.path.join(COMP_DIR, "train_masks"),
+        'test_images': TEST_DIR,
+        'sup_images': os.path.join(COMP_DIR, "supplemental_images"),
+        'sup_masks': os.path.join(COMP_DIR, "supplemental_masks")
+    }
+    
     # Test the HybridDataset
     train_transform = A.Compose([
         A.Resize(256, 256),
@@ -731,22 +746,30 @@ if __name__ == "__main__":
     ])
 
     dataset = HybridCropDataset(
-        f"train_data_crop_{384}px.h5",
-        "data/authentic",
-        "data/forged",
-        "data/masks",
-        img_size=384,
+        f"train_data_crop_{IMG_SIZE}px.h5",
+        paths['train_authentic'],
+        paths['train_forged'],
+        paths['train_masks'],
+        img_size=IMG_SIZE,
         is_train=True,
         preload=True,
         verbose=True,   
         train_transform=train_transform,
         test_transform=test_transform,
-        train_sample_num=100,
-        test_sample_num=20,
-        pad_mode='constant'
+        train_sample_num=None,
+        test_sample_num=None,
+        pad_mode=PAD_MODE,
+        rebuild_h5_if_needed=False,
+        supplemental_images_path=paths['sup_images'],
+        supplemental_masks_path=paths["sup_masks"]
     )
 
 
     print(f"Dataset length: {len(dataset)}")
     img, mask, path, is_forged = dataset[0]
     print(f"Image shape: {img.shape}, Mask shape: {mask.shape}, Path: {path}, Is Forged: {is_forged}")
+    
+    for img, mask, path, is_forged in dataset:
+        if mask.sum() > 0:
+            print("mask 존재")
+            break
